@@ -1,0 +1,20 @@
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Dados e Modelos (Arquivos grandes que o GitHub não aceita bem)
+data/
+*.pt
+*.pth
+*.csv
+
+# VS Code
+.vscode/
+
+# Arquivos
+*.zip
