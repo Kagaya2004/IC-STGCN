@@ -58,7 +58,7 @@ def preparar_loaders(base_path, batch_size=32):
     """
     Organiza a divisão dos dados para a Iniciação Científica (80/10/10)
     """
-    data_path = os.path.join(base_path, "data_chicago_final.npy")
+    data_path = os.path.join(base_path, "data_chicago.npy")
     
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Arquivo não encontrado: {data_path}. Execute o dataCleaning.py primeiro.")
