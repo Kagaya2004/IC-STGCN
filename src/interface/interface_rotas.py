@@ -1,113 +1,193 @@
 import streamlit as st
 import pandas as pd
 import folium
-from geopy.geocoders import Nominatim
-from geopy.distance import geodesic
-from streamlit_folium import st_folium
+from folium.plugins import AntPath
+import torch
+import numpy as np
 import os
+import sys
+import requests
+from streamlit_folium import st_folium
 
-# --- FUNÇÃO DE BUSCA E INTERPOLAÇÃO ---
-def buscar_e_mapear_entrega(endereco, df_meta):
-    """
-    Transforma texto em coordenada e encontra o nó mais próximo com interpolação.
-    """
-    geolocator = Nominatim(user_agent="chicago_delivery_ic")
+# 1. Configuração de Ambiente e Caminhos
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from src.modelo.modelo_STGCN import STGCN_TrafficModel
+from src.otimizador.otimizador_rotas import gerar_matriz_custos, resolver_tsp
+
+# --- PALETA DE CORES ---
+CORES_TRECHOS = ['#3388ff', '#ff3333', '#22aa22', '#ffaa00', '#aa33ff', '#33cccc', '#cc3388']
+
+# --- FUNÇÕES DE APOIO ---
+def formatar_tempo_logistico(minutos_decimais):
+    """Converte minutos para formato amigável (ex: 2min 15seg)."""
+    total_seg = int(minutos_decimais * 60)
+    minutos, segundos = divmod(total_seg, 60)
+    return f"{minutos}min {segundos}seg" if minutos > 0 else f"{segundos}seg"
+
+def obter_geometria_trecho(coord_origem, coord_destino):
+    """Consulta o OSRM para obter o traçado real das ruas entre dois pontos."""
+    url = f"http://router.project-osrm.org/route/v1/driving/{coord_origem[1]},{coord_origem[0]};{coord_destino[1]},{coord_destino[0]}?overview=full&geometries=geojson"
     try:
-        # Adicionamos ", Chicago, IL" para garantir que a busca seja na cidade correta
-        location = geolocator.geocode(f"{endereco}, Chicago, IL")
-        if not location:
-            return None
-        
-        ponto_entrega = (location.latitude, location.longitude)
-        
-        # Encontrar o segmento (nó) mais próximo no nosso grafo de 60 nós
-        distancias = []
-        for i, row in df_meta.iterrows():
-            inicio_rua = (row['START_LATITUDE'], row['START_LONGITUDE'])
-            dist = geodesic(ponto_entrega, inicio_rua).meters
-            distancias.append(dist)
-        
-        idx_mais_proximo = distancias.index(min(distancias))
-        no_selecionado = df_meta.iloc[idx_mais_proximo]
-        
-        return {
-            "coords": ponto_entrega,
-            "node_index": no_selecionado['NODE_INDEX'],
-            "rua": no_selecionado['STREET'],
-            "distancia_ao_inicio": min(distancias)
-        }
+        r = requests.get(url)
+        geometria = r.json()['routes'][0]['geometry']['coordinates']
+        return [[p[1], p[0]] for p in geometria]
     except:
-        return None
+        return [coord_origem, coord_destino]
 
-# --- INTERFACE STREAMLIT ---
-st.set_page_config(layout="wide", page_title="Chicago Predictive Logistics")
+# --- CARREGAMENTO DE RECURSOS ---
+st.set_page_config(page_title="Chicago AI Route Optimizer", layout="wide", page_icon="🚦")
 
-st.title("📦 Otimizador Logístico com IA e Interpolação")
-st.markdown("""
-    Este sistema integra a predição da **STGCN** (MAE 1.51 MPH) com o solver **OR-Tools**.
-    Diferente de sistemas comuns, aplicamos **interpolação linear** para precisão predial.
-""")
+@st.cache_resource
+def load_resources():
+    """Carrega o modelo STGCN e os pesos treinados."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    base = r"C:\IC\Aplication"
+    model = STGCN_TrafficModel(num_nodes=60, num_features=2).to(device)
+    pesos = os.path.join(base, "src", "modelo", "best_stgcn_chicago.pt")
+    model.load_state_dict(torch.load(pesos, map_location=device, weights_only=True))
+    return model, device
 
-# Barra Lateral
-st.sidebar.header("📍 Cadastro de Entregas")
-endereco_input = st.sidebar.text_input("Digite o endereço da entrega:", placeholder="Ex: 500 N Michigan Ave")
+@st.cache_data
+def load_meta():
+    """Carrega os metadados das vias de Chicago."""
+    df = pd.read_csv(r"C:\IC\Aplication\data\tratados\node_metadata.csv")
+    for col in ['START_LATITUDE', 'START_LONGITUDE', 'LENGTH']:
+        df[col] = df[col].astype(str).str.replace(',', '.').astype(float)
+    return df
 
-if 'lista_entregas' not in st.session_state:
-    st.session_state.lista_entregas = []
+# --- ESTADO DA SESSÃO ---
+if 'entregas' not in st.session_state: st.session_state.entregas = []
+if 'trechos_coloridos' not in st.session_state: st.session_state.trechos_coloridos = []
+if 'resultados' not in st.session_state: st.session_state.resultados = {}
 
-if st.sidebar.button("Adicionar à Rota"):
-    meta = pd.read_csv("data/tratados/node_metadata.csv")
-    # Limpeza de vírgula para ponto
-    for col in ['START_LATITUDE', 'START_LONGITUDE']:
-        meta[col] = meta[col].astype(str).str.replace(',', '.').astype(float)
-        
-    resultado = buscar_e_mapear_entrega(endereco_input, meta)
-    if resultado:
-        st.session_state.lista_entregas.append(resultado)
-        st.sidebar.success(f"Adicionado: {resultado['rua']}")
-    else:
-        st.sidebar.error("Endereço não encontrado em Chicago.")
+meta = load_meta()
+modelo, device = load_resources()
 
-# --- EXIBIÇÃO ---
-col1, col2 = st.columns([1, 2])
+st.title("🏙️ Otimizador Preditivo de Rotas - Chicago")
+st.markdown("Otimização baseada em **Deep Learning (STGCN)** e **Pesquisa Operacional (OR-Tools)**.")
 
-with col1:
-    st.subheader("📋 Fila de Entregas")
-    if st.session_state.lista_entregas:
-        df_entregas = pd.DataFrame(st.session_state.lista_entregas)
-        st.dataframe(df_entregas[['rua', 'node_index']])
-        if st.button("Limpar Rota"):
-            st.session_state.lista_entregas = []
-            st.rerun()
-    else:
-        st.write("Nenhuma entrega cadastrada.")
-
-with col2:
-    st.subheader("🗺️ Mapa de Precisão")
-    m = folium.Map(location=[41.8781, -87.6298], zoom_start=12, tiles='cartodbpositron')
+# --- BARRA LATERAL ---
+with st.sidebar:
+    st.header("📋 Gerenciamento de Paradas")
+    if st.button("🗑️ LIMPAR TUDO", use_container_width=True, type="primary"):
+        st.session_state.entregas = []; st.session_state.trechos_coloridos = []; st.session_state.resultados = {}; st.rerun()
     
-    for ent in st.session_state.lista_entregas:
-        folium.Marker(
-            ent['coords'], 
-            popup=f"Entrega no Nó {ent['node_index']}",
-            icon=folium.Icon(color='blue', icon='home')
-        ).add_to(m)
+    st.divider()
+    if st.session_state.entregas:
+        for i, ent in enumerate(st.session_state.entregas):
+            c1, c2 = st.columns([4, 1])
+            c1.write(f"**{i+1}.** {ent['rua']}")
+            if c2.button("❌", key=f"del_{i}"):
+                st.session_state.entregas.pop(i); st.session_state.trechos_coloridos = []; st.rerun()
         
-    st_folium(m, width=800, height=450)
+        st.divider()
+        if st.button("🚀 OTIMIZAR E GERAR COORDENADAS", use_container_width=True):
+            with st.spinner("IA processando tráfego e calculando vias..."):
+                ids = [e['node_index'] for e in st.session_state.entregas]
+                base = r"C:\IC\Aplication"
+                
+                # 1. IA e Otimizador
+                matriz, v_med_mph, _ = gerar_matriz_custos(modelo, 
+                    os.path.join(base, "data/tratados/data_chicago.npy"),
+                    os.path.join(base, "data/tratados/node_metadata.csv"),
+                    os.path.join(base, "data/tratados/scaler_stats.csv"),
+                    device, ids)
+                
+                ordem_ids, tempo_min, _ = resolver_tsp(matriz, ids, v_med_mph)
+                
+                if ordem_ids:
+                    legs = []
+                    for i in range(len(ordem_ids) - 1):
+                        row_origem = meta[meta['NODE_INDEX']==ordem_ids[i]].iloc[0]
+                        row_destino = meta[meta['NODE_INDEX']==ordem_ids[i+1]].iloc[0]
+                        
+                        orig_coord = [row_origem['START_LATITUDE'], row_origem['START_LONGITUDE']]
+                        dest_coord = [row_destino['START_LATITUDE'], row_destino['START_LONGITUDE']]
+                        
+                        geometria = obter_geometria_trecho(orig_coord, dest_coord)
+                        
+                        legs.append({
+                            "coords": geometria,
+                            "cor": CORES_TRECHOS[i % len(CORES_TRECHOS)],
+                            "orig_nome": row_origem['STREET'],
+                            "orig_coord": f"{orig_coord[0]}, {orig_coord[1]}",
+                            "dest_nome": row_destino['STREET'],
+                            "dest_coord": f"{dest_coord[0]}, {dest_coord[1]}"
+                        })
+                    
+                    st.session_state.trechos_coloridos = legs
+                    v_kmh = v_med_mph * 1.60934
+                    st.session_state.resultados = {
+                        "tempo_fmt": formatar_tempo_logistico(tempo_min),
+                        "v_kmh": v_kmh,
+                        "dist_km": v_kmh * (tempo_min / 60),
+                        "ordem_indices": ordem_ids
+                    }
+    else:
+        st.info("Adicione paradas clicando nos círculos verdes do mapa.")
 
-# --- COMPARATIVO (BASELINE) ---
-st.divider()
-st.subheader("⚖️ Comparativo de Performance (Predição IA vs. Comercial)")
-c1, c2 = st.columns(2)
+# --- MAPA ---
+st.subheader("🗺️ Visualização Geográfica do Percurso")
+m = folium.Map(location=[41.8818, -87.6231], zoom_start=14, tiles='cartodbpositron')
 
-with c1:
-    st.info("**Rota STGCN (Sua IA)**")
-    st.write("- Antecipa congestionamentos em 1h.")
-    st.write("- Erro Médio: 1.51 MPH")
-    st.metric("Tempo Previsto", "14.2 min", delta="-2.1 min (Economia)")
+for trecho in st.session_state.trechos_coloridos:
+    AntPath(locations=trecho['coords'], color=trecho['cor'], pulse_color='white', weight=6).add_to(m)
 
-with c2:
-    st.warning("**Rota Padrão (Waze/Google)**")
-    st.write("- Reativo (baseado no trânsito agora).")
-    st.write("- Sem consciência da topologia do grafo.")
-    st.metric("Tempo Estimado", "16.3 min")
+for _, row in meta.iterrows():
+    idx_no = int(row['NODE_INDEX'])
+    ordem = None
+    if st.session_state.resultados:
+        ids_seq = st.session_state.resultados['ordem_indices']
+        if idx_no in ids_seq: ordem = ids_seq.index(idx_no) + 1
+    else:
+        for i, e in enumerate(st.session_state.entregas):
+            if e['node_index'] == idx_no: ordem = i + 1; break
+
+    if ordem:
+        folium.Marker(
+            location=[row['START_LATITUDE'], row['START_LONGITUDE']],
+            icon=folium.DivIcon(html=f"""<div style="color:white; background:blue; border-radius:50%; width:28px; height:28px; display:flex; align-items:center; justify-content:center; font-weight:bold; border:2px solid white;">{ordem}</div>"""),
+            tooltip=f"Ponto {ordem}: {row['STREET']}"
+        ).add_to(m)
+    else:
+        folium.CircleMarker(location=[row['START_LATITUDE'], row['START_LONGITUDE']], radius=6, color='green', fill=True, fill_opacity=0.3).add_to(m)
+
+map_out = st_folium(m, width=1200, height=500, key="mapa_multicolor_coords")
+
+if map_out.get("last_object_clicked"):
+    lat, lng = map_out["last_object_clicked"]["lat"], map_out["last_object_clicked"]["lng"]
+    match = meta[np.isclose(meta['START_LATITUDE'], lat, atol=1e-4) & np.isclose(meta['START_LONGITUDE'], lng, atol=1e-4)]
+    if not match.empty:
+        idx = int(match.iloc[0]['NODE_INDEX'])
+        if not any(e['node_index'] == idx for e in st.session_state.entregas):
+            st.session_state.entregas.append({"node_index": idx, "rua": match.iloc[0]['STREET']})
+            st.session_state.trechos_coloridos = []; st.session_state.resultados = {}; st.rerun()
+
+# --- RESULTADOS E TABELA DETALHADA COM COORDENADAS ---
+if st.session_state.resultados:
+    st.divider()
+    res = st.session_state.resultados
+    c1, c2, c3 = st.columns(3)
+    c1.metric("⏱️ Tempo Total Estimado", res['tempo_fmt'])
+    c2.metric("🚀 Velocidade Média (Rede)", f"{res['v_kmh']:.1f} km/h")
+    c3.metric("📏 Distância Total", f"{res['dist_km']:.2f} km")
+
+    st.subheader("🚩 Itinerário Detalhado (Coordenadas de Nós)")
+    itinerario = []
+    for i, t in enumerate(st.session_state.trechos_coloridos):
+        itinerario.append({
+            "Trecho": f"{i+1}º",
+            "Origem": t['orig_nome'],
+            "Lat/Lon (Origem)": t['orig_coord'],
+            "Destino": t['dest_nome'],
+            "Lat/Lon (Destino)": t['dest_coord'],
+            "Cor Mapa": t['cor']
+        })
+    
+    df_iti = pd.DataFrame(itinerario)
+    
+    def color_trecho(val):
+        return f'background-color: {val}; color: white; font-weight: bold;'
+    
+    # Exibição com o estilo corrigido para Pandas 2.1+
+    st.table(df_iti.style.map(color_trecho, subset=['Cor Mapa']))

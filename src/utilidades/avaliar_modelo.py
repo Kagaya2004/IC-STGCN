@@ -22,7 +22,7 @@ def avaliar_stgcn_final():
     # 1. Configuração de Caminhos
     base_dir = r"C:\IC\Aplication"
     data_dir = os.path.join(base_dir, "data", "tratados")
-    model_path = os.path.join(base_dir, "src", "modelos", "pesos", "best_stgcn_chicago.pt")
+    model_path = os.path.join(base_dir, "src", "modelo", "best_stgcn_chicago.pt")
     
     # 2. Carregar Estatísticas de Normalização (Crucial para o Artigo)
     stats = pd.read_csv(os.path.join(data_dir, "scaler_stats.csv"))

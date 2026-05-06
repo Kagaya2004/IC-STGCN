@@ -20,7 +20,7 @@ def treinar_stgcn():
     base_dir = r"C:\IC\Aplication"
     data_dir = os.path.join(base_dir, "data", "tratados")
     logs_dir = os.path.join(base_dir, "data", "logs")
-    model_save_dir = os.path.join(base_dir, "src", "modelos", "pesos")
+    model_save_dir = os.path.join(base_dir, "src", "modelo")
     os.makedirs(logs_dir, exist_ok=True)
     os.makedirs(model_save_dir, exist_ok=True)
 
