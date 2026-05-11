@@ -4,71 +4,64 @@ import torch.nn.functional as F
 
 class TemporalConv(nn.Module):
     """
-    Camada de Convolução Temporal: Captura dependências ao longo do tempo.
-    Utiliza uma estrutura de Gated Linear Unit (GLU) para filtrar informações.
+    Captura a evolução do tráfego no tempo usando Gated Linear Units (GLU).
     """
     def __init__(self, in_channels, out_channels, kernel_size=3):
         super(TemporalConv, self).__init__()
-        # A saída é dobrada (out_channels * 2) para a operação de gate (GLU)
+        # Saída dobrada para permitir a operação de Gate (GLU)
         self.conv = nn.Conv2d(in_channels, out_channels * 2, (kernel_size, 1), padding=(1, 0))
 
     def forward(self, x):
-        # x shape: (Batch, Channels, Timesteps, Nodes)
+        # x shape: (Batch, Canais, Tempo, Nós)
         x = self.conv(x)
-        # Divide o tensor ao meio na dimensão dos canais para aplicar o gate
+        # GLU: Divide os canais ao meio. Metade vira filtro, metade vira porta (sigmoid)
         p, q = torch.split(x, x.shape[1] // 2, dim=1)
         return p * torch.sigmoid(q)
 
 class SpatialConv(nn.Module):
     """
-    Camada de Convolução Espacial: Captura a topologia da malha viária.
-    Utiliza a Matriz de Adjacência (W) injetada durante o treino.
+    Captura a influência das ruas vizinhas usando Convolução em Grafo (GCN).
     """
     def __init__(self, in_channels, out_channels):
         super(SpatialConv, self).__init__()
         self.theta = nn.Linear(in_channels, out_channels)
-        self.adj = None  # Será injetada pelo script de treinamento
 
-    def forward(self, x):
-        # x shape: (Batch, Channels, Timesteps, Nodes)
-        # Permuta para (Batch, Timesteps, Nodes, Channels) para facilitar a multiplicação
-        x = x.permute(0, 2, 3, 1)
+    def forward(self, x, adj):
+        # x shape: (Batch, Canais, Tempo, Nós)
+        # adj: Matriz de Adjacência Ponderada (N, N)
         
-        # Agregação baseada no Grafo: X_vizinho = W * X
-        if self.adj is not None:
-            # Multiplicação matricial da vizinhança
-            x = torch.matmul(self.adj, x)
-        
-        # Transformação Linear (Pesos treináveis da GCN)
-        x = self.theta(x)
-        x = F.relu(x)
-        
-        # Retorna para o formato original (Batch, Channels, Timesteps, Nodes)
-        return x.permute(0, 3, 1, 2)
+        # 1. Agregação de Vizinhança via Grafo
+        # Permuta para (Batch, Tempo, Canais, Nós) para multiplicar pelo grafo
+        x_perm = x.permute(0, 2, 1, 3)
+        # Multiplicação matricial: Cada nó recebe a média ponderada dos seus vizinhos
+        out = torch.matmul(x_perm, adj)
+        # 2. Transformação Linear (Aprendizado de Pesos)
+        out = self.theta(out.permute(0, 1, 3, 2))
+        return out.permute(0, 3, 1, 2)
 
 class STConvBlock(nn.Module):
     """
-    Bloco Espaço-Temporal "Sanduíche": Temporal -> Espacial -> Temporal.
-    Inclui conexões residuais e LayerNorm para estabilidade na RTX 3050.
+    Bloco Espaço-Temporal: Temporal -> Espacial -> Temporal.
     """
-    def __init__(self, in_channels, hidden_channels, out_channels):
+    def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.2):
         super(STConvBlock, self).__init__()
         self.tmp_conv1 = TemporalConv(in_channels, hidden_channels)
         self.spa_conv = SpatialConv(hidden_channels, hidden_channels)
         self.tmp_conv2 = TemporalConv(hidden_channels, out_channels)
         self.ln = nn.LayerNorm(out_channels)
+        self.dropout = nn.Dropout(dropout)
         
-        # Conexão residual para evitar desvanecimento de gradiente
+        # Conexão Residual para evitar desvanecimento do gradiente
         self.residual = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x, adj):
         res = self.residual(x)
         x = self.tmp_conv1(x)
-        x = self.spa_conv(x)
+        x = self.spa_conv(x, adj)
         x = self.tmp_conv2(x)
+        x = self.dropout(x)
         
-        # Normalização e Resíduo
-        # x shape: (B, C, T, N) -> LayerNorm espera canais no final
+        # Layer Normalization
         x = x.permute(0, 2, 3, 1)
         x = self.ln(x)
         x = x.permute(0, 3, 1, 2)
@@ -77,36 +70,34 @@ class STConvBlock(nn.Module):
 
 class STGCN_TrafficModel(nn.Module):
     """
-    Modelo STGCN Principal.
-    Configurado para: 60 nós, 2 features de entrada e predição de 3 horas.
+    Arquitetura STGCN V2.0 para Chicago.
+    Entrada: (Batch, 2 features, 12 timesteps, 60 nós)
+    Saída: (Batch, 1 feature, 12 timesteps, 60 nós)
     """
-    def __init__(self, num_nodes=60, num_features=2, num_timesteps_input=12, num_timesteps_output=12):
+    def __init__(self, num_nodes, num_features, num_timesteps_input, num_timesteps_output):
         super(STGCN_TrafficModel, self).__init__()
         
-        # Camada de entrada para projetar as 2 features (Velocidade + Dia) para 64 canais
-        self.input_conv = nn.Conv2d(num_features, 64, 1)
+        # 1. Projeção de Entrada (Expande as 2 features para 64 canais internos)
+        self.input_layer = nn.Conv2d(num_features, 64, 1)
         
-        # Blocos Espaço-Temporais
+        # 2. Empilhamento de Blocos Espaço-Temporais
         self.block1 = STConvBlock(64, 32, 64)
         self.block2 = STConvBlock(64, 32, 64)
         
-        # Camada de Saída (Predição Multi-Step)
-        # Reduz os Timesteps de entrada para a dimensão de saída desejada
+        # 3. Camada de Saída (Regressão para o Horizonte de Predição)
         self.output_layer = nn.Sequential(
             nn.Conv2d(64, 128, (num_timesteps_input, 1)),
             nn.ReLU(),
             nn.Conv2d(128, num_timesteps_output, 1)
         )
 
-    def forward(self, x):
-        # Entrada x: (Batch, Features=2, Timesteps=12, Nodes=60)
-        x = self.input_conv(x)
-        
-        x = self.block1(x)
-        x = self.block2(x)
-        
-        # Saída: (Batch, Timesteps_Output=12, 1, Nodes=60)
+    def forward(self, x, adj):
+        # Injeção de dados
+        x = self.input_layer(x)
+        # Processamento Híbrido
+        x = self.block1(x, adj)
+        x = self.block2(x, adj)
+        # Predição final
         x = self.output_layer(x)
-        
-        # Ajusta shape para (Batch, Timesteps, Nodes) para o cálculo da Loss (MSE)
-        return x.squeeze(2)
+        # Reshape para (Batch, 1, Output_Steps, Nodes)
+        return x.unsqueeze(1)
