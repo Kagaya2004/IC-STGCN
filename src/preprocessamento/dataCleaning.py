@@ -3,77 +3,82 @@ import numpy as np
 import os
 from sklearn.preprocessing import StandardScaler
 
-def executar_limpeza_stgcn(caminho_csv, pasta_saida):
-    print("Iniciando processamento avançado (multi-feature)...")
+def processar_tensores_stgcn(caminho_csv, pasta_saida):
+    print("🧪 Iniciando processamento de tensores para STGCN...")
     
-    # 1. Carregar Dados e Metadados para manter a ordem dos 60 nós
+    # 1. Carregamento e Alinhamento de Sensores
     df = pd.read_csv(caminho_csv)
     df['TIME'] = pd.to_datetime(df['TIME'])
     
-    # Carregamos os metadados para garantir que o índice 0-59 seja sempre o mesmo
+    # Carregamos apenas os sensores validados na etapa da Matriz de Adjacência
     meta = pd.read_csv(os.path.join(pasta_saida, "node_metadata.csv"))
+    sensores_validos = meta['SEGMENT_ID'].tolist()
+    df = df[df['SEGMENT_ID'].isin(sensores_validos)].copy()
+    
     id_para_idx = dict(zip(meta['SEGMENT_ID'], meta['NODE_INDEX']))
     num_nós = len(meta)
+
+    # 2. Sincronização Temporal (Bin de 10 min) por Sequência
+    print("⏱️ Sincronizando frequências de 10 min...")
+    df['TIME'] = df['TIME'].dt.round('10min')
     
-    # 2. Limpeza Técnica de Velocidade
-    # Filtro de outliers: 0mph costuma ser erro de sensor em Chicago
-    df.loc[(df['SPEED'] <= 0) | (df['SPEED'] > 80), 'SPEED'] = np.nan
+    # Pivotagem: Criamos uma estrutura [Tempo x Sensor] para Velocidade e Máscara
+    # Preenchemos com NaN para identificar buracos reais
+    pivot_speed = df.pivot_table(index='TIME', columns='SEGMENT_ID', values='SPEED')
     
-    # 3. Pivotagem Multi-Feature
-    # Criamos o mapeamento de nós
-    df['node_idx'] = df['SEGMENT_ID'].map(id_para_idx)
+    # Reordenar colunas conforme o NODE_INDEX da matriz de adjacência
+    pivot_speed = pivot_speed.reindex(columns=sensores_validos)
+
+    # 3. Tratamento de Gaps e Interpolação Limitada
+    # Só interpolamos falhas menores que 30 minutos (3 registros)
+    # Gaps maiores que isso (como o de 9 meses) permanecem como NaN
+    print("🩹 Aplicando interpolação seletiva...")
+    pivot_speed = pivot_speed.interpolate(method='linear', limit=3, axis=0)
+
+    # 4. Geração da Máscara de Perda (Masking)
+    # 1.0 onde temos dado, 0.0 onde é NaN ou Zero
+    mask_tensor = (~pivot_speed.isna() & (pivot_speed > 0)).astype(float).values
+
+    # 5. Engenharia de Atributos Temporais (Cíclicos)
+    print("📅 Gerando atributos temporais cíclicos (Seno/Cosseno)...")
+    times = pivot_speed.index
+    # Hora do dia (0-23)
+    hour_sin = np.sin(2 * np.pi * times.hour / 24)
+    hour_cos = np.cos(2 * np.pi * times.hour / 24)
     
-    print("Pivotando canais de Velocidade e Dia da Semana...")
-    # Canal 1: Velocidade
-    pivot_speed = df.pivot_table(index='TIME', columns='node_idx', values='SPEED')
-    
-    # Canal 2: Dia da Semana (1=Dom, 7=Sáb)
-    pivot_day = df.pivot_table(index='TIME', columns='node_idx', values='DAY_OF_WEEK')
+    # 6. Normalização (Z-Score)
+    # Preenchemos NaNs temporariamente com a média para o scaler não quebrar
+    scaler = StandardScaler()
+    speed_array = pivot_speed.fillna(pivot_speed.mean()).values
+    speed_norm = scaler.fit_transform(speed_array)
 
-    # 4. Resample Temporal (15 minutos)
-    # Padroniza a frequência para as camadas de TCN da STGCN
-    res_speed = pivot_speed.resample('15Min').mean()
-    res_day = pivot_day.resample('15Min').first() # Dia da semana é constante na janela
-
-    # 5. Interpolação e Tratamento da Lacuna
-    # Preenchemos falhas pequenas (<1h), mas a lacuna de 6 meses continua como NaN
-    res_speed = res_speed.ffill(limit=2).interpolate(method='linear', limit=4)
-    res_day = res_day.ffill() # Dia da semana é fácil de preencher
-
-    # 6. Normalização Z-Score (Crucial para convergência)
-    print("Normalizando dados...")
-    scaler_speed = StandardScaler()
-    # Para o dia da semana, normalizamos para escala 0-1 ou Z-score
-    scaler_day = StandardScaler()
-
-    # Preenchemos o que sobrou com a média apenas para o cálculo do scaler
-    norm_speed = scaler_speed.fit_transform(res_speed.fillna(res_speed.mean()))
-    norm_day = scaler_day.fit_transform(res_day.fillna(res_day.mean()))
-
-    # Salvar estatísticas para desnormalização na fase de predição real
+    # Salvar estatísticas para desnormalização no Frontend
     stats = pd.DataFrame({
-        'feature': ['speed', 'day_of_week'],
-        'mean': [scaler_speed.mean_.mean(), scaler_day.mean_.mean()],
-        'std': [np.sqrt(scaler_speed.var_).mean(), np.sqrt(scaler_day.var_).mean()]
+        'feature': ['speed'],
+        'mean': [scaler.mean_.mean()],
+        'std': [np.sqrt(scaler.var_).mean()]
     })
     stats.to_csv(os.path.join(pasta_saida, "scaler_stats.csv"), index=False)
 
-    # 7. Construção do Tensor Final (Timesteps, Canais, Nós)
-    # Formato esperado: (T, 2, 60)
-    data_final = np.stack([norm_speed, norm_day], axis=1).astype('float32')
+    # 7. Construção do Tensor Final (T, N, C)
+    # Canal 0: Velocidade Normalizada
+    # Canal 1: Hora do Dia (Seno) - Ajuda a IA a entender picos de manhã/tarde
+    
+    # Broadcast da hora para todos os nós
+    hour_feature = np.tile(hour_sin[:, np.newaxis], (1, num_nós))
+    
+    data_final = np.stack([speed_norm, hour_feature], axis=-1).astype('float32')
 
     # 8. Salvamento Binário
-    npy_path = os.path.join(pasta_saida, "data_chicago.npy")
-    np.save(npy_path, data_final)
+    np.save(os.path.join(pasta_saida, "data_chicago.npy"), data_final)
+    np.save(os.path.join(pasta_saida, "mask_chicago.npy"), mask_tensor)
     
-    print("-" * 40)
-    print(f"PROCESSAMENTO CONCLUÍDO!")
-    print(f"Shape do Tensor: {data_final.shape} (Timesteps, Features, Nós)")
-    print(f"Arquivo salvo: {npy_path}")
-    print(f"Metadados preservados em: node_metadata.csv")
-    print("-" * 40)
+    print(f"✅ Tensores gerados: {data_final.shape}")
+    print(f"💾 Arquivos salvos em: {pasta_saida}")
 
 if __name__ == "__main__":
-    caminho_merged = r"C:\IC\Aplication\data\tratados\dataset_unificado_stgcn.csv"
-    diretorio_data = r"C:\IC\Aplication\data\tratados"
-    executar_limpeza_stgcn(caminho_merged, diretorio_data)
+    pasta = r"C:\IC\Aplication\data\tratados"
+    processar_tensores_stgcn(
+        os.path.join(pasta, "dataset_unificado_stgcn.csv"),
+        pasta
+    )
