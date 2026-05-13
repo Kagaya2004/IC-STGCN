@@ -4,101 +4,117 @@ import torch.optim as optim
 import numpy as np
 import pandas as pd
 import os
-import time
-from datetime import datetime
+from torch.utils.data import DataLoader, TensorDataset
 
-# Importações do seu projeto
+# Importações do projeto
 from src.modelo.modelo_STGCN import STGCN_TrafficModel
-from src.preprocessamento.dataLoader import preparar_loaders
 
-def treinar_stgcn():
-    # 1. Configurações de Hardware
+def masked_mae_loss(y_pred, y_true, mask):
+    """
+    Calcula o MAE ignorando falhas de sensores.
+    Garante que as dimensões batam antes da operação.
+    """
+    # FIX: Força o alinhamento de dimensões para evitar RuntimeError
+    y_pred = y_pred.reshape(y_true.shape)
+    mask = mask.reshape(y_true.shape)
+    
+    mask = mask.float()
+    mask /= torch.mean(mask)
+    mask = torch.where(torch.isnan(mask), torch.zeros_like(mask), mask)
+    
+    loss = torch.abs(y_pred - y_true)
+    loss = loss * mask
+    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
+    return torch.mean(loss)
+
+def create_windows(data, mask, window=12, horizon=12):
+    """Gera janelas de tempo respeitando a integridade dos dados."""
+    x, y, m = [], [], []
+    for i in range(len(data) - window - horizon):
+        slice_data = data[i : i+window+horizon]
+        # Só adiciona se não houver NaNs (evita o gap de 9 meses)
+        if not np.isnan(slice_data).any():
+            x.append(data[i : i+window])
+            y.append(data[i+window : i+window+horizon, :, 0]) # Alvo: Velocidade
+            m.append(mask[i+window : i+window+horizon])
+    return np.array(x), np.array(y), np.array(m)
+
+def treinar_modelo():
+    # 1. Configurações
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Treinando em: {device}")
-
-    # 2. Definição de Caminhos
     base_dir = r"C:\IC\Aplication"
     data_dir = os.path.join(base_dir, "data", "tratados")
-    logs_dir = os.path.join(base_dir, "data", "logs")
-    model_save_dir = os.path.join(base_dir, "src", "modelo")
-    os.makedirs(logs_dir, exist_ok=True)
-    os.makedirs(model_save_dir, exist_ok=True)
-
-    # 3. Carregar Estrutura do Grafo
-    adj_path = os.path.join(data_dir, "adj_mat_chicago.npy")
-    adj_mat = torch.from_numpy(np.load(adj_path)).to(device)
+    model_path = os.path.join(base_dir, "src", "modelo", "best_stgcn_chicago.pt")
     
-    # 4. Inicializar Modelos e Hiperparâmetros
-    # IMPORTANTE: num_features=2 (Velocidade + Dia da Semana)
-    model = STGCN_TrafficModel(
-        num_nodes=60, 
-        num_features=2, 
-        num_timesteps_input=12, 
-        num_timesteps_output=12
-    ).to(device)
+    # 2. Carregar Dados
+    print("📂 Carregando tensores e matriz de adjacência...")
+    adj_mx = np.load(os.path.join(data_dir, "adj_mx_chicago.npy"))
+    adj_mx = torch.from_numpy(adj_mx).float().to(device)
     
-    # Passa a matriz de adjacência para as camadas espaciais do modelo
-    for block in [model.block1, model.block2]:
-        block.spa_conv.adj = adj_mat
+    data = np.load(os.path.join(data_dir, "data_chicago.npy"))
+    mask = np.load(os.path.join(data_dir, "mask_chicago.npy"))
+    
+    # 3. Preparar Janelas
+    x_raw, y_raw, m_raw = create_windows(data, mask)
+    
+    if len(x_raw) == 0:
+        print("❌ Nenhuma janela válida encontrada. Verifique o dataCleaning.")
+        return
 
-    criterion = nn.MSELoss()
+    # Split 80/20
+    split = int(0.8 * len(x_raw))
+    # Input X no formato (Batch, Canais, Tempo, Nós) -> (B, 2, 12, 60)
+    train_x = torch.tensor(x_raw[:split]).permute(0, 3, 1, 2)
+    val_x = torch.tensor(x_raw[split:]).permute(0, 3, 1, 2)
+    
+    train_loader = DataLoader(TensorDataset(train_x, torch.tensor(y_raw[:split]), torch.tensor(m_raw[:split])), batch_size=32, shuffle=True)
+    val_loader = DataLoader(TensorDataset(val_x, torch.tensor(y_raw[split:]), torch.tensor(m_raw[split:])), batch_size=32)
+
+    # 4. Iniciar Modelo
+    model = STGCN_TrafficModel(num_nodes=60, num_features=2, num_timesteps_input=12, num_timesteps_output=12).to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
-    # 5. Preparar Dados (Batch 32 para RTX 3050)
-    train_loader, val_loader, _ = preparar_loaders(data_dir, batch_size=32)
+    # 5. Loop de Treino
+    print(f"🚀 Iniciando treinamento em {device}...")
+    best_loss = float('inf')
 
-    # 6. Loop de Treinamento
-    epochs = 50
-    history = []
-    best_val_loss = float('inf')
-    
-    print("\nIniciando Treinamento (50 Épocas)...")
-    start_time = time.time()
-
-    for epoch in range(epochs):
+    for epoch in range(50):
         model.train()
-        train_losses = []
-        
-        for x_batch, y_batch in train_loader:
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+        train_loss = 0
+        for x_batch, y_batch, m_batch in train_loader:
+            x_batch, y_batch, m_batch = x_batch.to(device), y_batch.to(device), m_batch.to(device)
             
             optimizer.zero_grad()
-            output = model(x_batch)
-            loss = criterion(output, y_batch)
+            
+            # Execução do modelo
+            output = model(x_batch, adj_mx)
+            
+            # FIX: Redimensiona a saída para (Batch, Tempo, Nós) para bater com o y_batch
+            y_pred = output.reshape(y_batch.shape)
+            
+            loss = masked_mae_loss(y_pred, y_batch, m_batch)
             loss.backward()
             optimizer.step()
-            
-            train_losses.append(loss.item())
-        
+            train_loss += loss.item()
+
         # Validação
         model.eval()
-        val_losses = []
+        val_loss = 0
         with torch.no_grad():
-            for x_val, y_val in val_loader:
-                x_val, y_val = x_val.to(device), y_val.to(device)
-                val_out = model(x_val)
-                val_loss = criterion(val_out, y_val)
-                val_losses.append(val_loss.item())
+            for x_v, y_v, m_v in val_loader:
+                x_v, y_v, m_v = x_v.to(device), y_v.to(device), m_v.to(device)
+                out_v = model(x_v, adj_mx)
+                y_pred_v = out_v.reshape(y_v.shape)
+                val_loss += masked_mae_loss(y_pred_v, y_v, m_v).item()
         
-        avg_train_loss = np.mean(train_losses)
-        avg_val_loss = np.mean(val_losses)
-        
-        # Salvar o melhor modelo (Best Weights)
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), os.path.join(model_save_dir, "best_stgcn_chicago.pt"))
+        avg_train = train_loss / len(train_loader)
+        avg_val = val_loss / len(val_loader)
+        print(f"Epoch {epoch+1:02d} | Loss: {avg_train:.4f} | Val: {avg_val:.4f}")
 
-        # Log de progresso
-        print(f"Época [{epoch+1}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-        history.append({'epoch': epoch+1, 'train_loss': avg_train_loss, 'val_loss': avg_val_loss})
-
-    total_time = (time.time() - start_time) / 60
-    print(f"\nTreinamento Finalizado em {total_time:.2f} minutos.")
-
-    # 7. Salvar Histórico para o Artigo
-    hist_df = pd.DataFrame(history)
-    hist_df.to_csv(os.path.join(logs_dir, "history_stgcn.csv"), index=False)
-    print(f"Histórico salvo em: logs/history_stgcn.csv")
+        if avg_val < best_loss:
+            best_loss = avg_val
+            torch.save(model.state_dict(), model_path)
+            print("⭐ Modelo salvo!")
 
 if __name__ == "__main__":
-    treinar_stgcn()
+    treinar_modelo()

@@ -3,82 +3,83 @@ import numpy as np
 import os
 from torch.utils.data import Dataset, DataLoader
 
-class TrafficDataset(Dataset):
-    def __init__(self, data_path, window_size=12, horizon=12):
+class ChicagoTrafficDataset(Dataset):
+    def __init__(self, data_path, mask_path, window_size=12, horizon=12):
         """
+        Dataset especializado para Chicago V2.0.
         Args:
-            data_path: Caminho para o 'data_chicago_final.npy' (Shape: T, 2, 60)
-            window_size: Histórico de entrada (12 passos = 3 horas)
-            horizon: Horizonte de predição (12 passos = 3 horas)
+            data_path: Caminho para 'data_chicago.npy' (T, N, C)
+            mask_path: Caminho para 'mask_chicago.npy' (T, N)
         """
-        # Carrega o tensor binário (Timesteps, Features, Nodes)
         self.data = np.load(data_path)
+        self.mask = np.load(mask_path)
         self.window_size = window_size
         self.horizon = horizon
         
-        # Gerar apenas índices que não cruzam a lacuna de dados (NaNs)
-        self.indices = self._filtrar_janelas_validas()
+        # Identificar apenas os índices que possuem dados contínuos
+        self.valid_indices = self._check_continuity()
 
-    def _filtrar_janelas_validas(self):
-        """
-        Varre os dados e remove índices onde a janela de entrada ou saída 
-        conteria buracos de dados (provenientes da lacuna de 6 meses).
-        """
-        valid_indices = []
+    def _check_continuity(self):
+        """Descarta janelas que cruzam o gap de 9 meses ou períodos sem dados."""
+        valid = []
         T = self.data.shape[0]
         
-        print(f"Analisando {T} timesteps para identificar janelas válidas...")
-        
-        # Percorre os dados verificando se há NaNs no bloco (janela + horizonte)
+        print(f"🔍 Validando integridade de {T} blocos temporais...")
         for i in range(T - self.window_size - self.horizon):
-            bloco = self.data[i : i + self.window_size + self.horizon, 0, :]
-            if not np.isnan(bloco).any():
-                valid_indices.append(i)
+            # Se houver NaN em qualquer parte da janela (Input + Output), a sequência é inválida
+            window_slice = self.data[i : i + self.window_size + self.horizon]
+            if not np.isnan(window_slice).any():
+                valid.append(i)
         
-        print(f"Filtro concluído: {len(valid_indices)} janelas prontas para treino.")
-        return valid_indices
+        print(f"✅ {len(valid)} sequências íntegras identificadas para treino.")
+        return valid
 
     def __len__(self):
-        return len(self.indices)
+        return len(self.valid_indices)
 
     def __getitem__(self, idx):
-        start_idx = self.indices[idx]
+        start_idx = self.valid_indices[idx]
         
-        # X: (Canais, Tempo, Nós) -> Entrada: Velocidade + Dia da Semana
-        # Pegamos o bloco (window, 2, 60) e transpomos para (2, window, 60)
-        x = self.data[start_idx : start_idx + self.window_size, :, :]
-        x = np.transpose(x, (1, 0, 2)) 
+        # X: (Canais, Tempo, Nós)
+        x = self.data[start_idx : start_idx + self.window_size]
+        x = torch.from_numpy(x).permute(2, 0, 1).float()
         
-        # Y: (Tempo, Nós) -> Alvo: Apenas Velocidade (Canal 0)
-        y = self.data[start_idx + self.window_size : start_idx + self.window_size + self.horizon, 0, :]
+        # Y: (Tempo, Nós) - Alvo é a Velocidade (Canal 0)
+        y = self.data[start_idx + self.window_size : start_idx + self.window_size + self.horizon, :, 0]
+        y = torch.from_numpy(y).float()
         
-        return torch.from_numpy(x).float(), torch.from_numpy(y).float()
+        # M: Máscara correspondente ao Y para cálculo da Loss
+        m = self.mask[start_idx + self.window_size : start_idx + self.window_size + self.horizon]
+        m = torch.from_numpy(m).float()
+        
+        return x, y, m
 
-def preparar_loaders(base_path, batch_size=32):
-    """
-    Organiza a divisão dos dados para a Iniciação Científica (80/10/10)
-    """
-    data_path = os.path.join(base_path, "data_chicago.npy")
+def preparar_loaders_v2(base_path, batch_size=32):
+    """Configura os DataLoaders para a Iniciação Científica."""
+    d_path = os.path.join(base_path, "data_chicago.npy")
+    m_path = os.path.join(base_path, "mask_chicago.npy")
     
-    if not os.path.exists(data_path):
-        raise FileNotFoundError(f"Arquivo não encontrado: {data_path}. Execute o dataCleaning.py primeiro.")
-
-    full_dataset = TrafficDataset(data_path)
+    full_dataset = ChicagoTrafficDataset(d_path, m_path)
     
-    # Divisão estatística para o artigo
+    # Divisão 80/10/10 para rigor acadêmico
     train_size = int(0.8 * len(full_dataset))
     val_size = int(0.1 * len(full_dataset))
     test_size = len(full_dataset) - train_size - val_size
     
     train_set, val_set, test_set = torch.utils.data.random_split(
         full_dataset, [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(42) # Reprodutibilidade científica
+        generator=torch.Generator().manual_seed(42)
     )
     
-    # Configuração para RTX 3050: pin_memory=True acelera transferência CPU -> GPU
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, pin_memory=True)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, pin_memory=True)
-    
-    print(f"Loaders criados: Treino={len(train_loader)} | Val={len(val_loader)} | Teste={len(test_loader)} (batches)")
-    return train_loader, val_loader, test_loader
+    # pin_memory=True é essencial para performance em GPUs como a RTX 3050
+    return (
+        DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_memory=True),
+        DataLoader(val_set, batch_size=batch_size, pin_memory=True),
+        DataLoader(test_set, batch_size=batch_size, pin_memory=True)
+    )
+
+if __name__ == "__main__":
+    # Teste rápido
+    path = r"C:\IC\Aplication\data\tratados"
+    tr, vl, ts = preparar_loaders_v2(path)
+    print("🚀 DataLoaders V2.0 prontos para o treinamento.")
