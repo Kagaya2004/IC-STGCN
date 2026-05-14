@@ -1,106 +1,104 @@
 import torch
 import numpy as np
 import pandas as pd
+import networkx as nx
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 import requests
-import datetime
+import os
 
-def gerar_matriz_custos_granular(model, data_path, meta_path, stats_path, device, delivery_indices):
+def criar_grafo_ponderado_ia(adj_mx, pred_speeds):
     """
-    Une IA e OSRM para criar uma matriz de custos baseada em predições futuras.
+    Transforma a matriz de adjacência num grafo NetworkX onde o peso 
+    das arestas é o tempo de viagem (Distância / Velocidade prevista).
+    """
+    G = nx.DiGraph()
+    num_nodes = adj_mx.shape[0]
+    
+    # Suposição baseada na Matriz de Adjacência: 
+    # adj_mx[i,j] costuma ser exp(-dist^2). Vamos recuperar uma métrica de custo.
+    for i in range(num_nodes):
+        for j in range(num_nodes):
+            weight_adj = adj_mx[i, j]
+            if weight_adj > 0 and i != j:
+                # Recuperamos uma distância aproximada (inverso do peso de adjacência)
+                distancia_aprox = 1.0 / weight_adj
+                
+                # Velocidade prevista pela IA para o nó de destino (convertida para km/h)
+                # Usamos um valor mínimo de 5km/h para evitar custos infinitos
+                v_ia_kmh = max(pred_speeds[j] * 1.609, 5.0)
+                
+                # Custo = Tempo (Minutos) = (Distância / Velocidade) * 60
+                tempo_custo = (distancia_aprox / v_ia_kmh) * 60
+                G.add_edge(i, j, weight=tempo_custo)
+    return G
+
+def gerar_matriz_custos_granular(model, data_path, stats_path, device, delivery_indices):
+    """
+    Calcula a matriz de custos entre entregas usando busca de caminho (Dijkstra) 
+    no grafo de sensores ponderado pela IA.
     """
     model.eval()
-    
-    # 1. Preparação da IA (Entrada Multicanal)
-    data = np.load(data_path) # (T, N, 2)
-    # Pegamos os últimos 12 passos de tempo para prever os próximos
-    x_raw = data[-12:, :, :] 
-    x_input = torch.from_numpy(x_raw).permute(2, 0, 1).unsqueeze(0).float().to(device)
+    data = np.load(data_path)
+    x_input = torch.from_numpy(data[-12:, :, :]).unsqueeze(0).float().to(device)
     
     stats = pd.read_csv(stats_path)
-    m_v = stats.loc[stats['feature'] == 'speed', 'mean'].values[0]
-    s_v = stats.loc[stats['feature'] == 'speed', 'std'].values[0]
+    mean_v, std_v = stats['mean'].values[0], stats['std'].values[0]
 
-    # Carregar matriz de adjacência para a inferência
-    adj_mx = torch.from_numpy(np.load(data_path.replace("data_chicago.npy", "adj_mx_chicago.npy"))).float().to(device)
+    adj_dir = os.path.dirname(data_path)
+    adj_mx_raw = np.load(os.path.join(adj_dir, "adj_mx_chicago.npy"))
+    adj_mx_tensor = torch.from_numpy(adj_mx_raw).float().to(device)
 
     with torch.no_grad():
-        # Predição da rede STGCN
-        pred_norm = model(x_input, adj_mx).squeeze() # (12, 60)
-        # Desnormalização e clipping de segurança (5 a 80 mph)
-        v_preditas = (pred_norm.cpu().numpy() * s_v) + m_v
-        v_preditas = np.clip(v_preditas, 5.0, 80.0)
-        
-        # Cálculo do Índice de Impedância (Média do horizonte de 2h)
-        # Índice > 1 significa que a rua está mais lenta que o normal
-        indices_por_sensor = m_v / np.mean(v_preditas, axis=0)
-        v_media_ia_kmh = np.mean(v_preditas) * 1.60934
+        prediction = model(x_input, adj_mx_tensor)
+        # Desnormalização e média do horizonte (próximos 30 min)
+        pred_speed_mph = (prediction[0] * std_v) + mean_v
+        avg_future_speed = torch.mean(pred_speed_mph[:3, :], dim=0).cpu().numpy()
 
-    # 2. OSRM: Distâncias e Duração base da malha viária (Cenário Livre)
-    meta = pd.read_csv(meta_path)
-    # Extraímos coordenadas dos sensores selecionados
-    coords = []
-    for idx in delivery_indices:
-        node = meta.loc[meta['NODE_INDEX'] == idx]
-        coords.append(f"{node['START_LONGITUDE'].values[0]},{node['START_LATITUDE'].values[0]}")
+    # Criar o grafo inteligente
+    G = criar_grafo_ponderado_ia(adj_mx_raw, avg_future_speed)
     
-    url = f"http://router.project-osrm.org/table/v1/driving/{';'.join(coords)}?annotations=duration"
-    
-    try:
-        r = requests.get(url).json()
-        matriz_base = np.array(r['durations']) # Duração em segundos (asfalto vazio)
-        
-        # 3. FUSÃO HÍBRIDA: Aplicação do peso da IA no custo de cada trecho
-        matriz_final = np.zeros_like(matriz_base)
-        for i in range(len(delivery_indices)):
-            for j in range(len(delivery_indices)):
-                # O custo para chegar ao destino 'j' é penalizado pelo sensor local de 'j'
-                idx_sensor_destino = delivery_indices[j]
-                peso_local = indices_por_sensor[idx_sensor_destino]
-                matriz_final[i, j] = matriz_base[i, j] * peso_local
-                
-        return matriz_final.astype(int), v_media_ia_kmh
-    except Exception as e:
-        print(f"Erro na API OSRM: {e}")
-        return np.zeros((len(delivery_indices), len(delivery_indices))), v_media_ia_kmh
+    num_delivery = len(delivery_indices)
+    matriz_custo = np.zeros((num_delivery, num_delivery))
+
+    # Preenche a matriz de custos calculando o caminho mais rápido entre cada entrega
+    for i in range(num_delivery):
+        for j in range(num_delivery):
+            if i == j: continue
+            try:
+                # Dijkstra para encontrar o tempo mínimo entre dois sensores de entrega
+                custo_tempo = nx.shortest_path_length(G, source=delivery_indices[i], 
+                                                     target=delivery_indices[j], weight='weight')
+                matriz_custo[i, j] = int(custo_tempo * 100)
+            except nx.NetworkXNoPath:
+                matriz_custo[i, j] = 99999 # Penalidade se não houver conexão no grafo
+
+    return matriz_custo, avg_future_speed, G
 
 def resolver_open_tsp(matriz_custo, delivery_indices):
-    """
-    Resolve o Open TSP (caminho aberto) usando Google OR-Tools.
-    """
-    num_nos = len(matriz_custo)
+    """Resolve a ordem das entregas (TSP Aberto)."""
+    num_nodes = len(matriz_custo)
+    matriz_com_dummy = np.zeros((num_nodes + 1, num_nodes + 1), dtype=int)
+    matriz_com_dummy[:num_nodes, :num_nodes] = matriz_custo
     
-    # Para tornar o TSP "Aberto", adicionamos um Nó Dummy (nó fantasma)
-    # O custo para ir de qualquer nó para o dummy é ZERO.
-    matriz_com_dummy = np.zeros((num_nos + 1, num_nos + 1), dtype=int)
-    matriz_com_dummy[:num_nos, :num_nos] = matriz_custo
-    
-    # Manager: (número de nós, número de veículos, nó inicial)
-    manager = pywrapcp.RoutingIndexManager(num_nos + 1, 1, 0)
+    manager = pywrapcp.RoutingIndexManager(num_nodes + 1, 1, 0)
     routing = pywrapcp.RoutingModel(manager)
-    
-    def transit_callback(from_index, to_index):
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        return matriz_com_dummy[from_node][to_node]
 
-    transit_callback_index = routing.RegisterTransitCallback(transit_callback)
+    def distance_callback(from_index, to_index):
+        return matriz_com_dummy[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
+
+    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
-    
-    # Parâmetros de busca
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = (
-        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
+    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
 
     solution = routing.SolveWithParameters(search_parameters)
-    
     if solution:
         index = routing.Start(0)
         rota_ordenada = []
         while not routing.IsEnd(index):
-            node_index = manager.IndexToNode(index)
-            if node_index < num_nos: # Ignora o nó dummy no resultado final
-                rota_ordenada.append(delivery_indices[node_index])
+            node_idx = manager.IndexToNode(index)
+            if node_idx < num_nodes:
+                rota_ordenada.append(delivery_indices[node_idx])
             index = solution.Value(routing.NextVar(index))
         return rota_ordenada
-    return []
+    return delivery_indices

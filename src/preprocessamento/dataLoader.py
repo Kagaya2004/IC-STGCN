@@ -6,80 +6,83 @@ from torch.utils.data import Dataset, DataLoader
 class ChicagoTrafficDataset(Dataset):
     def __init__(self, data_path, mask_path, window_size=12, horizon=12):
         """
-        Dataset especializado para Chicago V2.0.
+        Dataset especializado para a malha viaria de Chicago.
         Args:
             data_path: Caminho para 'data_chicago.npy' (T, N, C)
             mask_path: Caminho para 'mask_chicago.npy' (T, N)
+            window_size: Tamanho da janela de entrada (ex: 12 passos = 2 horas)
+            horizon: Horizonte de previsao (ex: 12 passos = 2 horas)
         """
-        self.data = np.load(data_path)
-        self.mask = np.load(mask_path)
+        # Carregamento dos dados em float32 para otimizacao de VRAM
+        self.data = np.load(data_path).astype(np.float32)
+        self.mask = np.load(mask_path).astype(np.float32)
         self.window_size = window_size
         self.horizon = horizon
         
-        # Identificar apenas os índices que possuem dados contínuos
-        self.valid_indices = self._check_continuity()
+        # Filtragem de janelas validas para evitar cruzamento de gaps temporais extensos
+        self.indices = self._gerar_indices_validos()
 
-    def _check_continuity(self):
-        """Descarta janelas que cruzam o gap de 9 meses ou períodos sem dados."""
-        valid = []
-        T = self.data.shape[0]
+    def _gerar_indices_validos(self):
+        """Identifica pontos de inicio de janela que nao contenham dados nulos."""
+        valid_indices = []
+        total_steps = self.data.shape[0]
         
-        print(f"🔍 Validando integridade de {T} blocos temporais...")
-        for i in range(T - self.window_size - self.horizon):
-            # Se houver NaN em qualquer parte da janela (Input + Output), a sequência é inválida
-            window_slice = self.data[i : i + self.window_size + self.horizon]
-            if not np.isnan(window_slice).any():
-                valid.append(i)
+        # Varredura para garantir que a janela completa (input + target) seja valida
+        # O limite e (Total - entrada - saida)
+        for i in range(total_steps - self.window_size - self.horizon):
+            # Verifica se existe algum valor NaN no canal de velocidade (canal 0)
+            if not np.isnan(self.data[i : i + self.window_size + self.horizon, :, 0]).any():
+                valid_indices.append(i)
         
-        print(f"✅ {len(valid)} sequências íntegras identificadas para treino.")
-        return valid
+        print(f"Indices temporais processados. Janelas validas encontradas: {len(valid_indices)}")
+        return valid_indices
 
     def __len__(self):
-        return len(self.valid_indices)
+        return len(self.indices)
 
     def __getitem__(self, idx):
-        start_idx = self.valid_indices[idx]
+        start_idx = self.indices[idx]
         
-        # X: (Canais, Tempo, Nós)
+        # X: Janela de entrada (Passos, Nos, Canais)
         x = self.data[start_idx : start_idx + self.window_size]
-        x = torch.from_numpy(x).permute(2, 0, 1).float()
         
-        # Y: (Tempo, Nós) - Alvo é a Velocidade (Canal 0)
+        # Y: Alvo da previsao (apenas canal 0: velocidade)
         y = self.data[start_idx + self.window_size : start_idx + self.window_size + self.horizon, :, 0]
-        y = torch.from_numpy(y).float()
         
-        # M: Máscara correspondente ao Y para cálculo da Loss
+        # M: Mascara correspondente ao Y (usada para ignorar perdas em dados ausentes)
         m = self.mask[start_idx + self.window_size : start_idx + self.window_size + self.horizon]
-        m = torch.from_numpy(m).float()
         
-        return x, y, m
+        return torch.from_numpy(x), torch.from_numpy(y), torch.from_numpy(m)
 
-def preparar_loaders_v2(base_path, batch_size=32):
-    """Configura os DataLoaders para a Iniciação Científica."""
-    d_path = os.path.join(base_path, "data_chicago.npy")
-    m_path = os.path.join(base_path, "mask_chicago.npy")
+def preparar_loaders_chicago(data_dir, batch_size=32, train_split=0.7, val_split=0.15):
+    """
+    Cria os objetos DataLoader para treino, validacao e teste.
+    """
+    caminho_dados = os.path.join(data_dir, "data_chicago.npy")
+    caminho_mask = os.path.join(data_dir, "mask_chicago.npy")
     
-    full_dataset = ChicagoTrafficDataset(d_path, m_path)
+    dataset_completo = ChicagoTrafficDataset(caminho_dados, caminho_mask)
     
-    # Divisão 80/10/10 para rigor acadêmico
-    train_size = int(0.8 * len(full_dataset))
-    val_size = int(0.1 * len(full_dataset))
-    test_size = len(full_dataset) - train_size - val_size
+    # Calculo de tamanhos para divisao do dataset
+    total = len(dataset_completo)
+    n_train = int(total * train_split)
+    n_val = int(total * val_split)
+    n_test = total - n_train - n_val
     
     train_set, val_set, test_set = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size, test_size],
+        dataset_completo, [n_train, n_val, n_test],
         generator=torch.Generator().manual_seed(42)
     )
     
-    # pin_memory=True é essencial para performance em GPUs como a RTX 3050
-    return (
-        DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_memory=True),
-        DataLoader(val_set, batch_size=batch_size, pin_memory=True),
-        DataLoader(test_set, batch_size=batch_size, pin_memory=True)
-    )
-
-if __name__ == "__main__":
-    # Teste rápido
-    path = r"C:\IC\Aplication\data\tratados"
-    tr, vl, ts = preparar_loaders_v2(path)
-    print("🚀 DataLoaders V2.0 prontos para o treinamento.")
+    # Configuracao de performance para RTX 3050 (num_workers e pin_memory)
+    params = {
+        'batch_size': batch_size,
+        'num_workers': 2,
+        'pin_memory': True
+    }
+    
+    train_loader = DataLoader(train_set, shuffle=True, **params)
+    val_loader = DataLoader(val_set, shuffle=False, **params)
+    test_loader = DataLoader(test_set, shuffle=False, **params)
+    
+    return train_loader, val_loader, test_loader

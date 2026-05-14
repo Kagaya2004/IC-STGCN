@@ -2,86 +2,72 @@ import pandas as pd
 import numpy as np
 import os
 
-def haversine_distance(lat1, lon1, lat2, lon2):
-    """Calcula a distância em metros entre dois pontos (Haversine)."""
-    R = 6371000  # Raio da Terra em metros
-    phi1, phi2 = np.radians(lat1), np.numeric(lat2) if not isinstance(lat2, str) else np.radians(float(lat2))
-    # Simplificação para uso com arrays numpy
-    phi1, phi2 = np.radians(lat1), np.radians(lat2)
-    dphi = np.radians(lat2 - lat1)
-    dlambda = np.radians(lon2 - lon1)
-    a = np.sin(dphi/2)**2 + np.cos(phi1)*np.cos(phi2)*np.sin(dlambda/2)**2
-    return 2 * R * np.arctan2(np.sqrt(a), np.sqrt(1-a))
-
-def gerar_estrutura_grafo_ponderada(caminho_dataset, output_dir):
-    print("🚀 Iniciando geração da estrutura de grafo ponderado...")
+def gerar_matriz_adjacencia():
+    # 1. Configuracoes de Caminho
+    base_dir = r"C:\IC\Aplication"
+    data_dir = os.path.join(base_dir, "data", "tratados")
+    caminho_csv = os.path.join(data_dir, "dataset_filtrado.csv")
     
-    # 1. Carregar o dataset unificado
-    df = pd.read_csv(caminho_dataset)
-    df['TIME'] = pd.to_datetime(df['TIME'])
+    caminho_adj = os.path.join(data_dir, "adj_mx_chicago.npy")
+    caminho_meta = os.path.join(data_dir, "node_metadata.csv")
 
-    # 2. MELHORIA 1: Interseção de IDs entre Anos
-    # Garante que só usaremos sensores que sobreviveram ao "gap" de 9 meses
-    sensores_2023 = set(df[df['TIME'].dt.year == 2023]['SEGMENT_ID'].unique())
-    sensores_2024 = set(df[df['TIME'].dt.year >= 2024]['SEGMENT_ID'].unique())
-    sensores_validos = sorted(list(sensores_2023.intersection(sensores_2024)))
-    
-    print(f"📊 Sensores em 2023: {len(sensores_2023)} | 2024+: {len(sensores_2024)}")
-    print(f"🔗 Interseção (sensores persistentes): {len(sensores_validos)}")
+    if not os.path.exists(caminho_csv):
+        print(f"Erro: Arquivo {caminho_csv} nao encontrado.")
+        return
 
-    # Filtrar metadados apenas para os sensores que existem em ambos os blocos
-    df_nós = df[df['SEGMENT_ID'].isin(sensores_validos)].drop_duplicates('SEGMENT_ID').copy()
-    df_nós = df_nós.sort_values('SEGMENT_ID').reset_index(drop=True)
-    df_nós['NODE_INDEX'] = df_nós.index
-    
-    # Salvar Metadados Atualizados
-    df_metadata = df_nós[['SEGMENT_ID', 'NODE_INDEX', 'START_LATITUDE', 'START_LONGITUDE', 'STREET']]
-    df_metadata.to_csv(os.path.join(output_dir, "node_metadata.csv"), index=False)
-    
-    # 3. Inicializar Matriz W (Ponderada)
-    num_nós = len(df_metadata)
-    id_para_idx = dict(zip(df_metadata['SEGMENT_ID'], df_metadata['NODE_INDEX']))
-    W = np.zeros((num_nós, num_nós))
+    print("Carregando dados para extracao de topologia...")
+    cols_topo = ['SEGMENT_ID', 'STREET', 'START_LATITUDE', 'START_LONGITUDE']
+    df = pd.read_csv(caminho_csv, usecols=cols_topo)
 
-    # 4. MELHORIA 2 e 3: Conectividade Direcionada e Gaussian Kernel
-    # sigma (distância padrão) para o kernel gaussiano (aprox. 10km na literatura de tráfego)
-    sigma2 = 10000**2 
-    epsilon = 0.1 # Threshold para evitar matrizes muito esparsas ou densas
+    # 2. Limpeza e Conversao de Coordenadas
+    # Garante que latitude e longitude sejam tratadas como numeros (float)
+    for col in ['START_LATITUDE', 'START_LONGITUDE']:
+        # Remove possiveis espacos, troca virgula por ponto e converte para numerico
+        df[col] = df[col].astype(str).str.replace(',', '.').str.strip()
+        df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    print("🛰️ Calculando adjacência espacial...")
+    # Remove linhas onde a conversao falhou (valores nulos)
+    df = df.dropna(subset=['START_LATITUDE', 'START_LONGITUDE'])
+
+    # 3. Identificacao de Nos Unicos
+    nos = df.drop_duplicates(subset=['SEGMENT_ID']).copy()
+    nos = nos.sort_values('SEGMENT_ID').reset_index(drop=True)
+    nos['NODE_INDEX'] = nos.index
+    num_nos = len(nos)
     
-    # Lógica de cruzamento e fluxo (Direcionado)
-    # Se o fim do segmento A (TO_STREET) é a rua do segmento B (STREET), há fluxo de A para B
-    if 'TO_STREET' in df.columns:
-        for _, row in df_nós.iterrows():
-            idx_i = id_para_idx[row['SEGMENT_ID']]
-            rua_destino = row['TO_STREET']
+    print(f"Total de nos identificados: {num_nos}")
+
+    # 4. Exportacao de Metadados
+    nos.to_csv(caminho_meta, index=False)
+    print(f"Metadados salvos em: {caminho_meta}")
+
+    # 5. Calculo da Matriz de Adjacencia Ponderada
+    adj_mx = np.zeros((num_nos, num_nos), dtype=np.float32)
+    coords = nos[['START_LATITUDE', 'START_LONGITUDE']].values
+
+    print("Calculando pesos de adjacencia (Gaussian Kernel)...")
+    
+    # Hiperparametros do Grafo
+    d_threshold = 0.01 
+    sigma_sq = 0.0001 
+
+    for i in range(num_nos):
+        for j in range(num_nos):
+            if i == j:
+                continue
             
-            # Vizinhos que estão na rua para onde o tráfego aponta
-            vizinhos = df_nós[df_nós['STREET'] == rua_destino]
+            # Agora os valores sao numericos, permitindo a operacao de subtracao vetorial
+            dist = np.linalg.norm(coords[i] - coords[j])
             
-            for _, v_row in vizinhos.iterrows():
-                idx_j = id_para_idx[v_row['SEGMENT_ID']]
-                
-                # Calcular distância física para o peso
-                dist = haversine_distance(
-                    row['START_LATITUDE'], row['START_LONGITUDE'],
-                    v_row['START_LATITUDE'], v_row['START_LONGITUDE']
-                )
-                
-                # Gaussian Kernel: W_ij = exp(-d^2 / sigma^2)
-                peso = np.exp(-(dist**2) / sigma2)
-                
-                if peso >= epsilon:
-                    W[idx_i, idx_j] = peso # Grafo direcionado: A influencia B
+            if dist <= d_threshold:
+                peso = np.exp(-(dist**2) / sigma_sq)
+                adj_mx[i, j] = peso
 
-    # 5. Salvar Matriz NumPy (.npy)
-    np.save(os.path.join(output_dir, "adj_mx_chicago.npy"), W)
-    print(f"✅ Sucesso! Matriz ponderada {W.shape} gerada com {np.count_nonzero(W)} conexões.")
+    # 6. Salvamento
+    np.save(caminho_adj, adj_mx)
+    
+    print(f"Sucesso: Matriz de adjacencia {num_nos}x{num_nos} gerada.")
+    print(f"Arquivo binario salvo em: {caminho_adj}")
 
 if __name__ == "__main__":
-    base = r"C:\IC\Aplication"
-    gerar_estrutura_grafo_ponderada(
-        os.path.join(base, "data", "tratados", "dataset_unificado_stgcn.csv"),
-        os.path.join(base, "data", "tratados")
-    )
+    gerar_matriz_adjacencia()
