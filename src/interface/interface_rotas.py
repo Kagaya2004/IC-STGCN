@@ -6,6 +6,7 @@ import torch
 import numpy as np
 import os, sys, requests, time
 import networkx as nx
+from datetime import datetime  # Biblioteca incluída para exibir o log de hora atual no painel
 from streamlit_folium import st_folium
 
 # Ajuste de Path para integração de módulos internos
@@ -75,6 +76,11 @@ if 'trecho_focado' not in st.session_state: st.session_state.trecho_focado = Non
 
 with st.sidebar:
     st.header("Gestão de Destinos")
+    
+    # Exibição informativa da sincronização temporal do modelo na interface
+    hora_atual_execucao = datetime.now().strftime("%H:%M")
+    st.info(f"🕒 Horário da Simulação: **{hora_atual_execucao}**")
+    st.caption("A STGCN extrairá as predições de fluxo correspondentes a este período.")
     
     with st.expander("Importar Lista (CSV)"):
         up_file = st.file_uploader("Ficheiro numero,rua", type="csv")
@@ -164,7 +170,6 @@ with c_met:
         df_m = pd.DataFrame(st.session_state.itinerario)
         st.subheader("Resumo da Rota")
         
-        # --- FUNCIONALIDADE: Distância e Tempo juntos ---
         col_m1, col_m2 = st.columns(2)
         col_m1.metric("Tempo Total", f"{df_m['tempo'].sum():.1f} min")
         col_m2.metric("Distância Total", f"{df_m['distancia'].sum():.2f} km")
