@@ -66,7 +66,8 @@ def calcular_leg(coord_o, coord_d, info_o, info_d, vel_pred_kmh):
 
 # --- UI CONFIG ---
 st.set_page_config(page_title="IA Chicago V2.0", layout="wide")
-st.title("Otimização de Percursos com Predição STGCN")
+st.title("RouteStation")
+st.caption("Versão de Desenvolvimento")
 
 model, meta = carregar_recursos()
 
