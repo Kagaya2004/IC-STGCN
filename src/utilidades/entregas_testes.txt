@@ -1,0 +1,17 @@
+Teste 1
+numero,rua
+210,E Grand Ave
+255,N State St
+290,E Ontario St
+
+Teste 2
+numero,rua
+210,E Grand Ave
+340,N Columbus Dr
+290,E Ontario St
+
+Teste 3
+numero,rua
+180,E Ontario St
+260,N State St
+320,E Grand Ave

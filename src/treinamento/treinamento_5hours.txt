@@ -1,0 +1,198 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import os
+import time
+import pandas as pd
+from datetime import timedelta
+
+from src.modelo.modelo_STGCN import STGCN_TrafficModel
+from src.preprocessamento.dataLoader import preparar_loaders_chicago
+
+def masked_mae_loss(y_pred, y_true, mask):
+    """
+    Calcula o Erro Absoluto Médio (MAE) de forma estável, ignorando 
+    os dados ausentes via máscara e blindado contra divisões por zero.
+    """
+    mask = mask.float()
+    loss = torch.abs(y_pred - y_true) * mask
+    return torch.sum(loss) / torch.clamp(torch.sum(mask), min=1.0)
+
+def treinar_modelo():
+    # 1. Configurações de Ambiente e Hardware Otimizadas para a GPU RTX 3050
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Dispositivo de execução detectado: {device}")
+    
+    dir_script = os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.abspath(os.path.join(dir_script, "..", ".."))
+    data_dir = os.path.join(base_dir, "data", "tratados")
+    model_dir = os.path.join(base_dir, "src", "modelo")
+    log_dir = os.path.join(base_dir, "data", "logs")
+    
+    os.makedirs(log_dir, exist_ok=True)
+
+    caminho_adj = os.path.join(data_dir, "adj_mx_chicago.npy")
+    caminho_stats = os.path.join(data_dir, "scaler_stats.csv")
+    
+    if not os.path.exists(caminho_adj) or not os.path.exists(caminho_stats):
+        print("Erro Crítico: Arquivos de topologia ou normalização ausentes.")
+        return
+
+    # 2. Carga e Pré-Cálculo Estável da Normalização Espectral (Kipf & Welling)
+    print("A carregar matriz de adjacência e executando normalização espectral de Kipf...")
+    adj_mx = np.load(caminho_adj)
+    
+    I = np.eye(adj_mx.shape[0])
+    A_tilde = adj_mx + I
+    deg = np.sum(A_tilde, axis=1)
+    
+    deg_inv_sqrt = np.zeros_like(deg, dtype=np.float32)
+    np.power(deg, -0.5, where=deg>0, out=deg_inv_sqrt)
+    D_tilde_inv = np.diag(deg_inv_sqrt)
+    
+    adj_norm_np = D_tilde_inv @ A_tilde @ D_tilde_inv
+    adj_norm_tensor = torch.tensor(adj_norm_np, dtype=torch.float32).to(device)
+    
+    df_stats = pd.read_csv(caminho_stats)
+    scaler_mean = df_stats['mean'].values[0]
+    scaler_std = df_stats['std'].values[0]
+
+    # 3. Hiperparâmetros e Carregamento de Lotes
+    batch_size = 32
+    window_size = 12
+    horizon = 12
+    num_nodes = adj_norm_tensor.shape[0]
+    num_features = 3
+    epochs = 50
+
+    print("Instanciando lotes paralelos com paginação de memória...")
+    train_loader, val_loader, test_loader = preparar_loaders_chicago(
+        batch_size=batch_size, window_size=window_size, horizon=horizon
+    )
+
+    model = STGCN_TrafficModel(
+        num_nodes=num_nodes, 
+        num_features=num_features, 
+        num_timesteps_input=window_size, 
+        num_timesteps_output=horizon
+    ).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0001)
+    
+    # RESOLUÇÃO DO USERWARNING: Removido o argumento depreciado verbose=True
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    
+    best_val_loss = float('inf')
+    history = []
+
+    print(f"\nIniciando Treinamento Otimizado da STGCN por {epochs} épocas na GPU...")
+    tempo_inicio_total = time.time()
+
+    for epoch in range(epochs):
+        tempo_inicio_epoca = time.time()
+        
+        # Captura a taxa de aprendizado corrente antes do passo de validação para monitoramento manual
+        lr_atual_antes = optimizer.param_groups[0]['lr']
+        
+        # --- TREINO ---
+        model.train()
+        train_loss_acumulada = 0.0
+        num_batches_train = 0
+        
+        for X_batch, y_true_batch, mask_batch in train_loader:
+            X_batch = X_batch.to(device)
+            y_true_batch = y_true_batch.to(device)
+            mask_batch = mask_batch.to(device)
+            
+            optimizer.zero_grad()
+            y_pred_batch = model(X_batch, adj_norm_tensor)
+            
+            loss = masked_mae_loss(y_pred_batch, y_true_batch, mask_batch)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss_acumulada += loss.item()
+            num_batches_train += 1
+            
+        train_loss_final = train_loss_acumulada / num_batches_train
+
+        # --- VALIDAÇÃO ---
+        model.eval()
+        val_loss_acumulada = 0.0
+        val_mae_real_acumulado = 0.0
+        num_batches_val = 0
+        
+        with torch.no_grad():
+            for X_batch, y_true_batch, mask_batch in val_loader:
+                X_batch = X_batch.to(device)
+                y_true_batch = y_true_batch.to(device)
+                mask_batch = mask_batch.to(device)
+                
+                y_pred_batch = model(X_batch, adj_norm_tensor)
+                loss = masked_mae_loss(y_pred_batch, y_true_batch, mask_batch)
+                val_loss_acumulada += loss.item()
+                
+                # Desnormalização para obtenção de métricas físicas reais
+                y_pred_real = (y_pred_batch * scaler_std) + scaler_mean
+                y_true_real = (y_true_batch * scaler_std) + scaler_mean
+                loss_real = torch.abs(y_pred_real - y_true_real) * mask_batch
+                mae_real = torch.sum(loss_real) / torch.clamp(torch.sum(mask_batch), min=1.0)
+                val_mae_real_acumulado += mae_real.item()
+                num_batches_val += 1
+                
+        val_loss_final = val_loss_acumulada / num_batches_val
+        val_mae_real_final = val_mae_real_acumulado / num_batches_val
+        
+        # Atualiza o Scheduler
+        scheduler.step(val_loss_final)
+        lr_atual_depois = optimizer.param_groups[0]['lr']
+        
+        # Print de monitoramento customizado substituto do verbose nativo
+        if lr_atual_depois < lr_atual_antes:
+            print(f"--> [Mecanismo Adaptativo] Queda de Taxa de Aprendizado detectada: {lr_atual_antes} -> {lr_atual_depois}")
+        
+        duracao_epoca = time.time() - tempo_inicio_epoca
+        
+        print(f"Época [{epoch+1:02d}/{epochs:02d}] | "
+              f"Train Loss: {train_loss_final:.4f} | "
+              f"Val Loss: {val_loss_final:.4f} | "
+              f"Val MAE Real: {val_mae_real_final:.2f} kmh/mph | "
+              f"LR: {lr_atual_depois} | "
+              f"Tempo: {duracao_epoca:.1f}s")
+
+        if val_loss_final < best_val_loss:
+            best_val_loss = val_loss_final
+            torch.save(model.state_dict(), os.path.join(model_dir, "best_stgcn_chicago.pt"))
+            print(f"-> Checkpoint salvo: Menor perda de validação atingida.")
+
+        history.append({
+            'epoch': epoch + 1, 'train_loss_norm': train_loss_final,
+            'val_loss_norm': val_loss_final, 'val_mae_real': val_mae_real_final,
+            'learning_rate': lr_atual_depois, 'duration_sec': duracao_epoca
+        })
+
+    # 6. Relatórios de Performance Computacional Consolidados
+    duracao_total = time.time() - tempo_inicio_total
+    tempo_formatado = str(timedelta(seconds=round(duracao_total)))
+    
+    print("\n" + "="*40)
+    print("       TREINAMENTO EXECUTADO COM SUCESSO")
+    print(f"Tempo Total Consumido: {tempo_formatado}")
+    print("="*40)
+
+    df_history = pd.DataFrame(history)
+    df_history.to_csv(os.path.join(log_dir, "history_stgcn.csv"), index=False)
+    
+    with open(os.path.join(log_dir, "performance_summary.txt"), "w", encoding="utf-8") as f:
+        f.write("====================================================\n")
+        f.write("  RESUMO DE PERFORMANCE COMPUTACIONAL - STGCN  \n")
+        f.write("====================================================\n")
+        f.write(f"Tempo Total de Treino (HH:MM:SS): {tempo_formatado}\n")
+        f.write(f"Tempo Total de Treino (segundos): {duracao_total:.2f}s\n")
+        f.write(f"Tempo Médio por Época: {df_history['duration_sec'].mean():.2f}s\n")
+        f.write(f"Melhor Loss Validação (Normalizada): {best_val_loss:.4f}\n")
+        f.write(f"Menor Erro de Velocidade Real: {df_history['val_mae_real'].min():.2f} kmh/mph\n")
+
+if __name__ == "__main__":
+    treinar_modelo()

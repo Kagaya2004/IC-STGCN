@@ -1,47 +1,36 @@
 import pandas as pd
-from pathlib import Path
+import os
 
-def filtrar_regiao():
-    # 1. Configuracoes de Caminho
-    base_dir = Path(__file__).resolve().parents[2]
-    input_file = base_dir / "data" / "tratados" / "dataset_unificado.csv"
-    output_file = base_dir / "data" / "tratados" / "dataset_filtrado.csv"
-    
-    if not input_file.exists():
-        print(f"Erro: Arquivo {input_file} não encontrado.")
-        return
+def filtrar_area_central():
+    base_dir = r"C:\IC\Aplication"
+    dir_tratados = os.path.join(base_dir, "data", "tratados")
+    input_csv = os.path.join(dir_tratados, "dataset_unificado.csv")
+    output_csv = os.path.join(dir_tratados, "dataset_filtrado.csv")
 
     print("Carregando dataset para filtragem espacial...")
-    df = pd.read_csv(input_file)
+    df = pd.read_csv(input_csv)
 
-    # 2. Definicao da Bounding Box (Loop de Chicago)
-    LAT_MIN, LAT_MAX = 41.8670, 41.8960
-    LON_MIN, LON_MAX = -87.6470, -87.6150
+    # 1. Conversao de seguranca (caso existam virgulas)
+    for col in ['START_LATITUDE', 'START_LONGITUDE']:
+        df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '.'), errors='coerce')
 
-    # 3. Filtragem Espacial Vetorizada
-    # Aplicamos a condição estrita: ambos os pontos (início e fim) devem estar no polígono
-    print("Aplicando filtro de Bounding Box...")
-    mask = (
-        (df['START_LATITUDE'] >= LAT_MIN) & (df['START_LATITUDE'] <= LAT_MAX) &
-        (df['END_LATITUDE'] >= LAT_MIN) & (df['END_LATITUDE'] <= LAT_MAX) &
-        (df['START_LONGITUDE'] >= LON_MIN) & (df['START_LONGITUDE'] <= LON_MAX) &
-        (df['END_LONGITUDE'] >= LON_MIN) & (df['END_LONGITUDE'] <= LON_MAX)
-    )
-    
-    df_filtrado = df.loc[mask].copy()
+    # 2. Definicao do Bounding Box (Retangulo da imagem 2)
+    lat_min, lat_max = 41.870, 41.898
+    lon_min, lon_max = -87.650, -87.610
 
-    # 4. Limpeza de Integridade
-    # Removemos linhas que possuam nulos nas colunas essenciais para o grafo/STGCN
-    cols_criticas = ['SPEED', 'TIME', 'START_LATITUDE', 'START_LONGITUDE', 'END_LATITUDE', 'END_LONGITUDE', 'LENGTH']
-    df_filtrado = df_filtrado.dropna(subset=cols_criticas)
-    
-    # Remove duplicacoes completas (sensores que reportaram no mesmo instante)
-    df_filtrado = df_filtrado.drop_duplicates()
+    # 3. Aplicacao do Filtro
+    df_central = df[
+        (df['START_LATITUDE'] >= lat_min) & (df['START_LATITUDE'] <= lat_max) &
+        (df['START_LONGITUDE'] >= lon_min) & (df['START_LONGITUDE'] <= lon_max)
+    ].copy()
 
-    # 5. Exportacao
-    df_filtrado.to_csv(output_file, index=False)
-    print(f"Filtragem concluída. Arquivo salvo em: {output_file}")
-    print(f"Linhas preservadas: {len(df_filtrado)} de {len(df)}")
+    print(f"Dataset original: {len(df)} linhas.")
+    print(f"Dataset centralizado: {len(df_central)} linhas.")
+    print(f"Sensores (Segmentos) na area: {df_central['SEGMENT_ID'].nunique()}")
+
+    # 4. Salvamento
+    df_central.to_csv(output_csv, index=False)
+    print(f"Sucesso: Novo dataset salvo em {output_csv}")
 
 if __name__ == "__main__":
-    filtrar_regiao()
+    filtrar_area_central()
