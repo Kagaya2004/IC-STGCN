@@ -1,0 +1,225 @@
+====== Chicago Traffic Tracker - Historical Congestion Estimates by Segment - 2018-2023 ======
+"This dataset contains the historical estimated congestion for over 1,000 traffic segments, 
+starting in approximately 2/28/2018 and ending 9/8/2023. Older records are in 
+https://data.cityofchicago.org/d/77hq-huss. 
+Newer records are in https://data.cityofchicago.org/d/4g9f-3jbs.
+
+The most recent estimate for each segment is in https://data.cityofchicago.org/d/n4j6-wkkf.
+
+The Chicago Traffic Tracker estimates traffic congestion on Chicago’s arterial streets (non-freeway streets) 
+in real-time by continuously monitoring and analyzing GPS traces received from Chicago Transit Authority (CTA) 
+buses. Two types of congestion estimates are produced every 10 minutes: 1) by Traffic Segments and 2) by Traffic 
+Regions or Zones. Congestion estimates by traffic segments gives observed speed typically for one-half mile of a 
+street in one direction of traffic. Traffic Segment level congestion is available for about 300 miles of principal 
+arterials.
+
+Congestion by Traffic Region gives the average traffic condition for all arterial street segments within a region. 
+A traffic region is comprised of two or three community areas with comparable traffic patterns. 29 regions are 
+created to cover the entire city (except O’Hare airport area). There is much volatility in traffic segment speed. 
+However, the congestion estimates for the traffic regions remain consistent for a relatively longer period. Most 
+volatility in arterial speed comes from the very nature of the arterials themselves. Due to a myriad of factors, 
+including but not limited to frequent intersections, traffic signals, transit movements, availability of 
+alternative routes, crashes, short length of the segments, etc. Speed on individual arterial segments can 
+fluctuate from heavily congested to no congestion and back in a few minutes.
+
+The segment speed and traffic region congestion estimates together may give a better understanding of the actual 
+traffic conditions."
+
+Column Name | Description | API Field name | Data Type:
+SEGMENT_ID - Unique arbitrary number to represent each segment. - segment_id - Number
+SPEED - Estimated traffic speed in miles per hour. A value of -1 means no estimate is available. - speed - Number
+STREET - Street name of the traffic segment. - street - Text
+DIRECTION - Traffic flow direction for the segment. - direction - Text
+FROM_STREET - Start street for the segment in the direction of traffic flow. - from_street - Text
+TO_STREET - End street for the segment in the direction of traffic flow. - to_street - Text
+LENGTH - Length of the segment in miles. - length - Number
+STREET_HEADING - The position of the segment in the address grid. North, South, East, or West of State and Madison. - street_heading - Text
+COMMENTS - - comments - Text
+BUS_COUNT - Number of buses providing a GPS feed used to estimate congestion. - bus_count - Number
+MESSAGE_COUNT - Number of GPS probes received(or used) for estimating the speed for that segment. - message_count - Number
+HOUR - Hour of the day. - hour - Number
+DAY_OF_WEEK - Day of the week. Sunday = 1 - day_of_week - Number
+MONTH - Month of the year. - month - Number
+RECORD_ID - A unique identifier for each record in the dataset. - record_id - Text
+START_LATITUDE - Latitude of the start of the segment. - start_latitude - Number
+START_LONGITUDE - Longitude of the start of the segment. - start_longitude - Number
+END_LATITUDE - Latitude of the end of the segment. - end_latitude - Number
+END_LONGITUDE - Longitude of the end of the segment. - end_longitude - Number
+START_LOCATION - Location of the start of the segment. - start_location - Point
+END_LOCATION - Location of the end of the segment. - end_location - Point
+
+Nomes das ruas presentes no dataset de 2018-2023:
+111th
+127th
+130th
+55th
+57th
+79th
+87th
+95th
+Archer
+Ashland
+Balbo
+Broadway
+Caldwell
+Cermak
+Chicago
+Cicero
+Clark
+Columbus
+Congress
+Cumberland
+Desplaines
+Dr Martin L King Jr
+Elston
+Ewing
+Fairbanks
+Garfield
+Grand
+Halsted
+Harlem
+Harrison
+Higgins
+Hollywood
+Illinois
+Indiana
+Irving Park
+Jackson
+Jefferson
+Lake Shore Dr
+LaSalle
+Madison
+Michigan
+Milwaukee
+Monterey
+North
+Ohio
+Ontario
+Pershing
+Peterson
+Pulaski
+Ramp To Cermak Rd
+Randolph
+Ridge
+Roosevelt
+Sheridan
+State
+Stony Island
+Torrence
+Touhy
+Wacker
+Warren
+Washington
+Western
+
+====== Chicago Traffic Tracker - Historical Congestion Estimates by Segment - 2024-Current ======
+"This dataset contains the historical estimated congestion for over 1,000 traffic segments, starting 6/11/2024 
+(except for a single time slice on 3/8/2024). Older records are in https://data.cityofchicago.org/d/sxs8-h27x.
+
+The most recent estimate for each segment is in https://data.cityofchicago.org/d/n4j6-wkkf.
+
+The Chicago Traffic Tracker estimates traffic congestion on Chicago’s arterial streets (non-freeway streets) in 
+real-time by continuously monitoring and analyzing GPS traces received from Chicago Transit Authority (CTA) buses.
+Two types of congestion estimates are produced every 10 minutes: 1) by Traffic Segments and 2) by Traffic Regions 
+or Zones. Congestion estimates by traffic segments gives observed speed typically for one-half mile of a street 
+in one direction of traffic. Traffic Segment level congestion is available for about 300 miles of principal arterials.
+
+Congestion by Traffic Region gives the average traffic condition for all arterial street segments within a region.
+A traffic region is comprised of two or three community areas with comparable traffic patterns. 29 regions are
+created to cover the entire city (except O’Hare airport area). There is much volatility in traffic segment speed. 
+However, the congestion estimates for the traffic regions remain consistent for a relatively longer period. Most 
+volatility in arterial speed comes from the very nature of the arterials themselves. Due to a myriad of factors, 
+including but not limited to frequent intersections, traffic signals, transit movements, availability of 
+alternative routes, crashes, short length of the segments, etc. Speed on individual arterial segments can 
+fluctuate from heavily congested to no congestion and back in a few minutes.
+
+The segment speed and traffic region congestion estimates together may give a better understanding of the 
+actual traffic conditions."
+
+Column Name | Description | API Field name | Data Type:
+TIME - - time - Floating Timestamp
+SEGMENT_ID - Unique arbitrary number to represent each segment. - segment_id - Number
+SPEED - Estimated traffic speed in miles per hour. A value of -1 means no estimate is available. - speed - Number
+STREET - Street name of the traffic segment. - street - Text
+DIRECTION - Traffic flow direction for the segment. - direction - Text
+FROM_STREET - Start street for the segment in the direction of traffic flow. - from_street - Text
+TO_STREET - End street for the segment in the direction of traffic flow. - to_street - Text
+LENGTH - Length of the segment in miles. - length - Number
+STREET_HEADING - The position of the segment in the address grid. North, South, East, or West of State and Madison. - street_heading - Text
+COMMENTS - - comments - Text
+BUS_COUNT - Number of buses providing a GPS feed used to estimate congestion. - bus_count - Number
+MESSAGE_COUNT - Number of GPS probes received(or used) for estimating the speed for that segment. - message_count - Number
+HOUR - Hour of the day. - hour - Number
+DAY_OF_WEEK - Day of the week. Sunday = 1 - day_of_week - Number
+MONTH - Month of the year. - month - Number
+RECORD_ID - A unique identifier for each record in the dataset. - record_id - Text
+START_LATITUDE - Latitude of the start of the segment. - start_latitude - Number
+START_LONGITUDE - Longitude of the start of the segment. - start_longitude - Number
+END_LATITUDE - Latitude of the end of the segment. - end_latitude - Number
+END_LONGITUDE - Longitude of the end of the segment. - end_longitude - Number
+START_LOCATION - Location of the start of the segment. - start_location - Point
+END_LOCATION - Location of the end of the segment. - end_location - Point
+
+Nomes das ruas presentes no dataset de 2024-Current:
+111th
+127th
+130th
+55th
+57th
+79th
+87th
+95th
+Archer
+Ashland
+Balbo
+Broadway
+Caldwell
+Cermak
+Chicago
+Cicero
+Clark
+Columbus
+Congress
+Cumberland
+Desplaines
+Dr Martin L King Jr
+Elston
+Ewing
+Fairbanks
+Garfield
+Grand
+Halsted
+Harlem
+Harrison
+Higgins
+Hollywood
+Illinois
+Indiana
+Irving Park
+Jackson
+Jefferson
+Lake Shore Dr
+LaSalle
+Madison
+Michigan
+Milwaukee
+Monterey
+North
+Ohio
+Ontario
+Pershing
+Peterson
+Pulaski
+Ramp To Cermak Rd
+Randolph
+Ridge
+Roosevelt
+Sheridan
+State
+Stony Island
+Torrence
+Touhy
+Wacker
+Warren
+Washington
+Western

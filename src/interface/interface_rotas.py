@@ -5,8 +5,6 @@ from folium.plugins import AntPath
 import torch
 import numpy as np
 import os, sys, requests, time
-import networkx as nx
-from datetime import datetime  # Biblioteca incluída para exibir o log de hora atual no painel
 from streamlit_folium import st_folium
 
 # Ajuste de Path para integração de módulos internos
@@ -18,6 +16,7 @@ from src.otimizador.otimizador_rotas import gerar_matriz_custos_granular, resolv
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 base_dir = r"C:\IC\Aplication"
 data_dir = os.path.join(base_dir, "data", "tratados")
+modelo_dir = os.path.join(base_dir, "src", "modelo")
 
 PALETA_CORES = [
     'blue', 'red', 'green', 'orange', 'purple', 
@@ -26,172 +25,185 @@ PALETA_CORES = [
 
 @st.cache_resource
 def carregar_recursos():
+    """ Carrega metadados, topologia e os pesos treinados da IA apenas uma vez. """
     meta = pd.read_csv(os.path.join(data_dir, "node_metadata.csv"))
-    for col in ['START_LATITUDE', 'START_LONGITUDE']:
-        meta[col] = pd.to_numeric(meta[col].astype(str).str.replace(',', '.'), errors='coerce')
-    meta = meta.dropna(subset=['START_LATITUDE', 'START_LONGITUDE'])
     
-    num_nos = len(meta)
-    model = STGCN_TrafficModel(num_nodes=num_nos, num_features=2, num_timesteps_input=12, num_timesteps_output=12).to(device)
+    # Matriz de adjacencia para a rede neural
+    adj_mx = np.load(os.path.join(data_dir, "adj_mx.npy"))
+    adj_tensor = torch.tensor(adj_mx, dtype=torch.float32).to(device)
     
-    model_path = os.path.join(base_dir, "src", "modelo", "best_stgcn_chicago.pt")
-    if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    # Inicializacao sincronizada com a ultima arquitetura
+    model = STGCN_TrafficModel(num_nodes=178, num_features=2, num_timesteps_input=12, num_timesteps_output=12, adj_mx=adj_tensor).to(device)
     
+    caminho_pesos = os.path.join(modelo_dir, "best_stgcn_chicago.pt")
+    if os.path.exists(caminho_pesos):
+        model.load_state_dict(torch.load(caminho_pesos, map_location=device))
+    else:
+        st.warning("Pesos do modelo não encontrados. Rodando com inicialização aleatória.")
+        
+    model.eval()
     return model, meta
 
-def geocodificar_endereco(numero, rua):
-    query = f"{numero} {rua}, Chicago, IL"
-    url = f"https://nominatim.openstreetmap.org/search?q={query}&format=json&limit=1"
-    headers = {'User-Agent': 'IC_Traffic_Project_Bot'}
+def geocodificar_endereco(endereco):
+    """ Busca coordenadas protegendo a requisicao com User-Agent exigido pelo Nominatim. """
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {'q': endereco + ", Chicago, IL", 'format': 'json', 'limit': 1}
+    headers = {'User-Agent': 'RouteStation_IC_Academic_Project/1.0 (contact@academico.com)'}
+    
     try:
-        res = requests.get(url, headers=headers).json()
-        if res: return float(res[0]['lat']), float(res[0]['lon'])
-    except: return None
-    return None
+        response = requests.get(url, params=params, headers=headers)
+        if response.status_code == 200 and len(response.json()) > 0:
+            res = response.json()[0]
+            return float(res['lat']), float(res['lon'])
+    except Exception as e:
+        st.error(f"Erro na API de Geocodificação: {e}")
+    return None, None
 
-def calcular_leg(coord_o, coord_d, info_o, info_d, vel_pred_kmh):
-    url = f"http://router.project-osrm.org/route/v1/driving/{coord_o[1]},{coord_o[0]};{coord_d[1]},{coord_d[0]}?overview=full&geometries=geojson"
-    try:
-        r = requests.get(url).json()['routes'][0]
-        dist_km = r['distance'] / 1000
-        t_ia = (dist_km / vel_pred_kmh) * 60 if vel_pred_kmh > 5 else r['duration'] / 60
-        return {
-            "origem": info_o['STREET'], "lat_o": info_o['START_LATITUDE'], "lon_o": info_o['START_LONGITUDE'],
-            "destino": info_d['STREET'], "lat_d": info_d['START_LATITUDE'], "lon_d": info_d['START_LONGITUDE'],
-            "coords_geo": [[p[1], p[0]] for p in r['geometry']['coordinates']],
-            "distancia": dist_km, "velocidade": vel_pred_kmh, "tempo": t_ia
-        }
-    except: return None
+def encontrar_no_mais_proximo(lat_usuario, lon_usuario, meta_df):
+    """ Ancora a coordenada do usuario ao sensor STGCN mais proximo. """
+    lat1 = np.radians(lat_usuario)
+    lon1 = np.radians(lon_usuario)
+    lat2 = np.radians(meta_df['START_LATITUDE'].values)
+    lon2 = np.radians(meta_df['START_LONGITUDE'].values)
 
-# --- UI CONFIG ---
-st.set_page_config(page_title="IA Chicago V2.0", layout="wide")
-st.title("RouteStation")
-st.caption("Versão de Desenvolvimento")
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+    c = 2 * np.arcsin(np.sqrt(a))
+    distancias_km = 6371.0 * c 
+    
+    return int(np.argmin(distancias_km))
+
+st.set_page_config(page_title="RouteStation - Otimizador IA", layout="wide")
+st.title("🚦 RouteStation - STGCN Otimizador")
 
 model, meta = carregar_recursos()
 
-if 'pontos' not in st.session_state: st.session_state.pontos = []
-if 'itinerario' not in st.session_state: st.session_state.itinerario = None
-if 'trecho_focado' not in st.session_state: st.session_state.trecho_focado = None
+if 'pontos' not in st.session_state:
+    st.session_state.pontos = []
+if 'itinerario' not in st.session_state:
+    st.session_state.itinerario = None
+if 'rotas_geo' not in st.session_state:
+    st.session_state.rotas_geo = None
 
 with st.sidebar:
     st.header("Gestão de Destinos")
+    endereco = st.text_input("Digite um endereço ou ponto de referência:")
     
-    # Exibição informativa da sincronização temporal do modelo na interface
-    hora_atual_execucao = datetime.now().strftime("%H:%M")
-    st.info(f"🕒 Horário da Simulação: **{hora_atual_execucao}**")
-    st.caption("A STGCN extrairá as predições de fluxo correspondentes a este período.")
+    if st.button("Adicionar Parada", use_container_width=True):
+        if endereco:
+            lat, lon = geocodificar_endereco(endereco)
+            if lat and lon:
+                no_ancora = encontrar_no_mais_proximo(lat, lon, meta)
+                rua_ancora = meta.iloc[no_ancora]['STREET']
+                st.session_state.pontos.append({
+                    'endereco_raw': endereco,
+                    'lat': lat, 'lon': lon,
+                    'idx': no_ancora,
+                    'rua': rua_ancora
+                })
+                st.success(f"Ancorado no sensor: {rua_ancora}")
+            else:
+                st.error("Endereço não encontrado.")
     
-    with st.expander("Importar Lista (CSV)"):
-        up_file = st.file_uploader("Ficheiro numero,rua", type="csv")
-        if up_file and st.button("Carregar CSV"):
-            df_up = pd.read_csv(up_file)
-            p_bar = st.progress(0)
-            for i, row in df_up.iterrows():
-                coords = geocodificar_endereco(row['numero'], row['rua'])
-                if coords:
-                    dists = (meta['START_LATITUDE'] - coords[0])**2 + (meta['START_LONGITUDE'] - coords[1])**2
-                    alvo = meta.loc[dists.idxmin()]
-                    st.session_state.pontos.append({"idx": int(alvo['NODE_INDEX']), "rua": f"{row['numero']} {row['rua']}"})
-                p_bar.progress((i+1)/len(df_up)); time.sleep(0.4)
-            st.rerun()
-
-    with st.expander("Entrada Manual", expanded=True):
-        n_casa = st.text_input("Número:")
-        r_nome = st.text_input("Rua:")
-        if st.button("Adicionar"):
-            coords = geocodificar_endereco(n_casa, r_nome)
-            if coords:
-                dists = (meta['START_LATITUDE'] - coords[0])**2 + (meta['START_LONGITUDE'] - coords[1])**2
-                alvo = meta.loc[dists.idxmin()]
-                st.session_state.pontos.append({"idx": int(alvo['NODE_INDEX']), "rua": f"{n_casa} {r_nome}"})
-                st.rerun()
-
-    st.divider()
-    st.subheader("Fila de Entregas")
-    for i, p in enumerate(st.session_state.pontos): st.text(f"{i+1}. {p['rua']}")
-    
-    if st.button("Limpar Tudo"):
-        st.session_state.pontos = []; st.session_state.itinerario = None; st.session_state.trecho_focado = None; st.rerun()
-
-    if len(st.session_state.pontos) > 1:
-        if st.button("Calcular Melhor Rota IA", type="primary"):
-            indices_brutos = [p['idx'] for p in st.session_state.pontos]
-            indices_unicos = []
-            for idx in indices_brutos:
-                if not indices_unicos or idx != indices_unicos[-1]: indices_unicos.append(idx)
+    if st.session_state.pontos:
+        st.write("---")
+        st.write("**Paradas Registradas:**")
+        for i, p in enumerate(st.session_state.pontos):
+            st.markdown(f"{i+1}. {p['endereco_raw']} *(Sensor: {p['rua']})*")
             
-            with st.spinner("Processando grafo dinâmico..."):
-                matriz, speeds, G_ia = gerar_matriz_custos_granular(model, os.path.join(data_dir, "data_chicago.npy"), 
-                                                               os.path.join(data_dir, "scaler_stats.csv"), device, indices_unicos)
-                ordem = resolver_open_tsp(matriz, indices_unicos)
-                res_it = []
-                for i in range(len(ordem)-1):
-                    try:
-                        caminho_ia = nx.shortest_path(G_ia, source=ordem[i], target=ordem[i+1], weight='weight')
-                        for s in range(len(caminho_ia)-1):
-                            o_idx, d_idx = caminho_ia[s], caminho_ia[s+1]
-                            o_i, d_i = meta.loc[meta['NODE_INDEX'] == o_idx].iloc[0], meta.loc[meta['NODE_INDEX'] == d_idx].iloc[0]
-                            v_kmh = speeds[d_idx] * 1.609
-                            leg = calcular_leg((o_i['START_LATITUDE'], o_i['START_LONGITUDE']), (d_i['START_LATITUDE'], d_i['START_LONGITUDE']), o_i, d_i, v_kmh)
-                            if leg: res_it.append(leg)
-                    except: continue
-                st.session_state.itinerario = res_it
-                st.session_state.trecho_focado = None
+        if st.button("Gerar Rota Otimizada com IA", type="primary", use_container_width=True):
+            with st.spinner("IA calculando propagação de tráfego..."):
+                indices_entrega = [p['idx'] for p in st.session_state.pontos]
+                
+                # Chamada do Otimizador Refatorado
+                matriz_custos, rotas_detalhadas, G = gerar_matriz_custos_granular(
+                    model,
+                    os.path.join(data_dir, "data_chicago.npy"),
+                    os.path.join(data_dir, "scaler_stats.csv"),
+                    os.path.join(data_dir, "adj_mx.npy"),
+                    device,
+                    indices_entrega
+                )
+                
+                rota_ordem = resolver_open_tsp(matriz_custos, indices_entrega)
+                
+                if rota_ordem:
+                    itinerario = []
+                    rotas_geo_detalhadas = []
+                    
+                    for i in range(len(rota_ordem) - 1):
+                        origem_idx = rota_ordem[i]
+                        destino_idx = rota_ordem[i+1]
+                        
+                        # Resgata o caminho de nos intermediarios do Dijkstra
+                        caminho_nos = rotas_detalhadas.get((origem_idx, destino_idx), [])
+                        
+                        # Converte nos para Coordenadas Geograficas Reais para o Mapa
+                        caminho_coords = [
+                            [meta.iloc[n]['START_LATITUDE'], meta.iloc[n]['START_LONGITUDE']] 
+                            for n in caminho_nos
+                        ]
+                        rotas_geo_detalhadas.append(caminho_coords)
+                        
+                        nome_origem = meta.iloc[origem_idx]['STREET']
+                        nome_destino = meta.iloc[destino_idx]['STREET']
+                        tempo_trecho = nx.shortest_path_length(G, origem_idx, destino_idx, weight='weight')
+                        dist_trecho = nx.shortest_path_length(G, origem_idx, destino_idx, weight='distance_km')
+                        
+                        itinerario.append({
+                            'origem': nome_origem, 'destino': nome_destino,
+                            'tempo': tempo_trecho, 'distancia': dist_trecho
+                        })
+                        
+                    st.session_state.itinerario = itinerario
+                    st.session_state.rotas_geo = rotas_geo_detalhadas
+                else:
+                    st.error("Não foi possível encontrar uma rota viável.")
+                    
+        if st.button("Limpar Rota", use_container_width=True):
+            st.session_state.pontos = []
+            st.session_state.itinerario = None
+            st.session_state.rotas_geo = None
+            st.rerun()
 
 # --- CONTEÚDO PRINCIPAL ---
 c_map, c_met = st.columns([2, 1])
 
 with c_map:
+    # Foco inicial no centro de Chicago
     m = folium.Map(location=[41.8818, -87.6231], zoom_start=14, tiles="cartodbpositron")
-    for _, row in meta.iterrows():
-        sel = any(p['idx'] == row['NODE_INDEX'] for p in st.session_state.pontos)
-        folium.CircleMarker(
-            location=[row['START_LATITUDE'], row['START_LONGITUDE']],
-            radius=4, color="green" if sel else "blue", fill=True, fill_opacity=0.5,
-            tooltip=f"Sensor: {row['STREET']}"
+    
+    # Plota a topologia real da rota desviando do transito
+    if st.session_state.rotas_geo:
+        for i, caminho_coords in enumerate(st.session_state.rotas_geo):
+            cor = PALETA_CORES[i % len(PALETA_CORES)]
+            AntPath(
+                locations=caminho_coords,
+                color=cor, weight=5, opacity=0.8,
+                tooltip=f"Trecho {i+1}"
+            ).add_to(m)
+
+    # Plota as paradas ancoradas
+    for i, p in enumerate(st.session_state.pontos):
+        folium.Marker(
+            location=[p['lat'], p['lon']],
+            popup=f"Parada {i+1}: {p['endereco_raw']}",
+            icon=folium.Icon(color="black", icon="info-sign")
         ).add_to(m)
 
-    if st.session_state.itinerario:
-        for i, l in enumerate(st.session_state.itinerario):
-            is_focado = (st.session_state.trecho_focado == i)
-            opacidade = 1.0 if (is_focado or st.session_state.trecho_focado is None) else 0.15
-            peso = 8 if is_focado else 5
-            
-            AntPath(l['coords_geo'], 
-                    color=PALETA_CORES[i % len(PALETA_CORES)], 
-                    weight=peso, 
-                    opacity=opacidade).add_to(m)
-    
-    st_folium(m, width=800, height=550)
+    st_folium(m, width=800, height=500, returned_objects=[])
 
 with c_met:
     if st.session_state.itinerario:
         df_m = pd.DataFrame(st.session_state.itinerario)
-        st.subheader("Resumo da Rota")
+        st.subheader("Painel da Rota Otimizada")
         
         col_m1, col_m2 = st.columns(2)
-        col_m1.metric("Tempo Total", f"{df_m['tempo'].sum():.1f} min")
+        col_m1.metric("Tempo Total Previsto", f"{df_m['tempo'].sum():.1f} min")
         col_m2.metric("Distância Total", f"{df_m['distancia'].sum():.2f} km")
-        
-        if st.session_state.trecho_focado is not None:
-            if st.button("Ver Rota Completa"):
-                st.session_state.trecho_focado = None; st.rerun()
-
         st.divider()
-        st.subheader("Navegação por Trecho")
+        
+        st.write("**Navegação Passo a Passo**")
         for i, r in df_m.iterrows():
-            if st.button(f"● Trecho {i+1}: {r['origem'][:12]} → {r['destino'][:12]}", key=f"b_{i}"):
-                st.session_state.trecho_focado = i; st.rerun()
-            if st.session_state.trecho_focado == i:
-                st.info(f"**Distância:** {r['distancia']:.2f} km | **Velocidade:** {r['velocidade']:.1f} km/h")
-
-# --- TABELA FINAL ---
-if st.session_state.itinerario:
-    st.divider()
-    st.subheader("Detalhamento Técnico Geográfico")
-    df_f = pd.DataFrame(st.session_state.itinerario)
-    tab = df_f[['origem', 'lat_o', 'lon_o', 'destino', 'lat_d', 'lon_d', 'distancia', 'velocidade', 'tempo']].copy()
-    tab.columns = ['Origem', 'Lat. O', 'Lon. O', 'Destino', 'Lat. D', 'Lon. D', 'Dist. (km)', 'IA (km/h)', 'Tempo (min)']
-    st.table(tab.style.format({'Lat. O': '{:.4f}', 'Lon. O': '{:.4f}', 'Lat. D': '{:.4f}', 'Lon. D': '{:.4f}', 'Dist. (km)': '{:.2f}', 'IA (km/h)': '{:.1f}', 'Tempo (min)': '{:.1f}'}))
+            st.info(f"**Trecho {i+1}:** {r['origem']} ➔ {r['destino']}\n\nTempo: {r['tempo']:.1f} min | Dist: {r['distancia']:.2f} km")

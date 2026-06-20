@@ -1,0 +1,36 @@
+import pandas as pd
+import os
+
+def filtrar_area_central():
+    # Configuracoes de Caminho
+    base_dir = r"C:\IC\Aplication"
+    dir_tratados = os.path.join(base_dir, "data", "tratados")
+    input_csv = os.path.join(dir_tratados, "dataset_unificado.csv")
+    output_csv = os.path.join(dir_tratados, "dataset_filtrado.csv")
+
+    print("Carregando dataset unificado massivo...")
+    # Lendo apenas as colunas necessarias para poupar memoria
+    df = pd.read_csv(input_csv, dtype={'STREET': 'category'})
+
+    # O "Grid" Perfeito de Chicago
+    vias_foco = [
+        'MICHIGAN', 'STATE', 'CLARK', 'LASALLE', 'HALSTED', 'DESPLAINES',
+        'RANDOLPH', 'WASHINGTON', 'MADISON', 'JACKSON', 'CONGRESS', 
+        'HARRISON', 'BALBO', 'ROOSEVELT'
+    ]
+
+    print(f"Filtrando malha estrita de {len(vias_foco)} vias...")
+    # Como garantimos que tudo ficou maiusculo no uniao_dataset, a comparacao eh direta
+    df_filtrado = df[df['STREET'].isin(vias_foco)].copy()
+
+    # Opcional, mas recomendado: Descartar categorias (nomes de ruas) que nao estao mais no dataset
+    df_filtrado['STREET'] = df_filtrado['STREET'].cat.remove_unused_categories()
+
+    print(f"Dataset reduzido de {len(df)} para {len(df_filtrado)} registros validos.")
+    
+    print("Salvando recorte topologico...")
+    df_filtrado.to_csv(output_csv, index=False)
+    print(f"Sucesso! Salvo em: {output_csv}")
+
+if __name__ == "__main__":
+    filtrar_area_central()

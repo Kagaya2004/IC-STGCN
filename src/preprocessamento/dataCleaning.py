@@ -47,10 +47,13 @@ def processar_tensores_treinamento():
     # A mascara identifica lacunas reais no dataset (1 = dado real, 0 = gap)
     mask_array = (~pivot_speed.isna()).astype('int8').values
 
-    # 6. Interpolacao e Normalizacao Z-Score
-    print("Tratando valores ausentes via interpolacao linear...")
-    # Interpola lacunas de ate 30 minutos; gaps maiores sao preenchidos com a media
-    pivot_speed = pivot_speed.interpolate(method='linear', axis=0, limit=3).fillna(pivot_speed.mean())
+    # 6. Imputacao Causal e Normalizacao Z-Score
+    print("Tratando valores ausentes via Forward Fill (Causal)...")
+    # Imputacao Primaria: ffill limitado a 3 passos de tempo (30 minutos)
+    pivot_speed = pivot_speed.ffill(limit=3)
+    
+    # Imputacao Secundaria: Preenche buracos profundos com 0 para estabilidade do Scaler
+    pivot_speed = pivot_speed.fillna(0)
     
     print("Aplicando normalizacao Z-Score...")
     scaler = StandardScaler()
@@ -63,13 +66,12 @@ def processar_tensores_treinamento():
     })
     stats.to_csv(os.path.join(data_dir, "scaler_stats.csv"), index=False)
 
-    # 7. Engenharia de Atributos Temporais (Resolucao do Erro de Indexacao)
+    # 7. Engenharia de Atributos Temporais
     print("Extraindo atributos de periodicidade horaria...")
     # Calculo da hora fracionaria
     hours_float = pivot_speed.index.hour + pivot_speed.index.minute / 60.0
     
     # Conversao explicita para NumPy antes da aplicacao de np.newaxis
-    # Esta etapa corrige o erro de Multi-dimensional indexing relatado
     hour_sin = np.sin(2 * np.pi * hours_float.to_numpy() / 24.0)
     
     # Expansao do vetor temporal para a forma (Tempo, Nos)

@@ -1,141 +1,100 @@
 import pandas as pd
 import numpy as np
-import networkx as nx
-from scipy.spatial import cKDTree
-from pathlib import Path
+import os
 
-def gerar_matriz_adjacencia(caminho_csv, caminho_adj, caminho_meta):
-    print("--- FASE 1: GERAÇÃO DA TOPOLOGIA ESPACIAL ---")
-    if not caminho_csv.exists():
-        print(f"Erro: Arquivo {caminho_csv} não encontrado.")
-        return False
-
-    # Leitura com as colunas espaciais exigidas
-    cols_req = ['SEGMENT_ID', 'LENGTH', 'START_LATITUDE', 'START_LONGITUDE', 'END_LATITUDE', 'END_LONGITUDE']
-    try:
-        df_bruto = pd.read_csv(caminho_csv, usecols=cols_req)
-    except ValueError as e:
-        print(f"Erro fatal: Colunas necessárias ausentes. Detalhe: {e}")
-        return False
-
-    # Limpeza e preenchimento de nulos com a mediana global
-    # Limpeza, Isolamento e Coerção de Tipos
-    nos = df_bruto.drop_duplicates(subset=['SEGMENT_ID']).copy()
-    nos = nos.sort_values('SEGMENT_ID').reset_index(drop=True)
-    num_nos = len(nos)
+def gerar_matriz_adjacencia():
+    # 1. Configuracoes de Caminho
+    base_dir = r"C:\IC\Aplication"
+    data_dir = os.path.join(base_dir, "data", "tratados")
+    caminho_csv = os.path.join(data_dir, "dataset_filtrado.csv")
     
-    # Tratamento crítico: Garantir que todas as variáveis espaciais sejam números (float)
-    colunas_espaciais = ['LENGTH', 'START_LATITUDE', 'START_LONGITUDE', 'END_LATITUDE', 'END_LONGITUDE']
-    for col in colunas_espaciais:
-        # Converte para string, troca vírgula por ponto (padrão americano), remove espaços
-        nos[col] = nos[col].astype(str).str.replace(',', '.').str.strip()
-        # Força a conversão para numérico; o que não for número vira NaN
-        nos[col] = pd.to_numeric(nos[col], errors='coerce')
+    caminho_meta_saida = os.path.join(data_dir, "node_metadata.csv")
+    caminho_matrix_saida = os.path.join(data_dir, "adj_mx.npy")
+
+    if not os.path.exists(caminho_csv):
+        print("Erro: dataset_filtrado.csv nao encontrado. Execute o filtro primeiro.")
+        return
+
+    print("Carregando dados filtrados para mapeamento de nos...")
+    df = pd.read_csv(caminho_csv)
+
+    # 2. Isolamento de Metadados Unicos por Segmento (Nos do Grafo)
+    # Agrupa por SEGMENT_ID para obter os atributos espaciais estaticos
+    print("Consolidando metadados dos nos (SEGMENT_ID)...")
+    df_nodes = df.groupby('SEGMENT_ID').agg({
+        'STREET': 'first',
+        'DIRECTION': 'first',
+        'FROM_STREET': 'first',
+        'TO_STREET': 'first',
+        'START_LATITUDE': 'first',
+        'START_LONGITUDE': 'first'
+    }).reset_index()
+
+    # Ordena de forma deterministica e cria o indice sequencial para as matrizes
+    df_nodes = df_nodes.sort_values('SEGMENT_ID').reset_index(drop=True)
+    df_nodes['NODE_INDEX'] = df_nodes.index
     
-    # Agora o cálculo da mediana funcionará perfeitamente, pois LENGTH é float
-    mediana_length = nos['LENGTH'].replace(0, np.nan).median()
-    nos['LENGTH'] = nos['LENGTH'].replace([0, np.nan], mediana_length)
+    # Salva o arquivo de metadados exigido pelo dataCleaning.py
+    df_nodes.to_csv(caminho_meta_saida, index=False)
+    print(f"Metadados salvos em: {caminho_meta_saida}. Total de nos (N): {len(df_nodes)}")
+
+    num_nodes = len(df_nodes)
     
-    nos[['SEGMENT_ID']].to_csv(caminho_meta, index=False)
+    # 3. Calculo Vetorizado da Distancia Haversine (Fisica)
+    print("Calculando matriz de distancias fisicas via NumPy Broadcasting...")
+    lat = np.radians(df_nodes['START_LATITUDE'].to_numpy())
+    lon = np.radians(df_nodes['START_LONGITUDE'].to_numpy())
 
-    # Inferência de Arestas por cKDTree
-    G = nx.DiGraph()
-    G.add_nodes_from(nos['SEGMENT_ID'])
+    # Expansao de eixos para forcar a operacao matricial NxN
+    lat_i, lat_j = lat[:, np.newaxis], lat[np.newaxis, :]
+    lon_i, lon_j = lon[:, np.newaxis], lon[np.newaxis, :]
 
-    start_coords = nos[['START_LATITUDE', 'START_LONGITUDE']].values
-    end_coords = nos[['END_LATITUDE', 'END_LONGITUDE']].values
-    segment_ids = nos['SEGMENT_ID'].values
-    lengths = nos['LENGTH'].values
+    dlat = lat_j - lat_i
+    dlon = lon_j - lon_i
 
-    tree_starts = cKDTree(start_coords)
-    tolerancia_graus = 0.00015 # Snapping de GPS (~15 metros)
-    vizinhos = tree_starts.query_ball_point(end_coords, r=tolerancia_graus)
+    # Formula Haversine estruturada em matrizes
+    a = np.sin(dlat / 2.0)**2 + np.cos(lat_i) * np.cos(lat_j) * np.sin(dlon / 2.0)**2
+    dist_matrix = 2 * 6371.0 * np.arcsin(np.sqrt(a)) # Distancia em quilometros
 
-    arestas = []
-    for i, lista_vizinhos_j in enumerate(vizinhos):
-        origem = segment_ids[i]
-        peso_distancia = lengths[i] 
-        for j in lista_vizinhos_j:
-            destino = segment_ids[j]
-            if origem != destino:
-                arestas.append((origem, destino, {'weight': peso_distancia}))
+    # Aplicacao do decaimento Gaussiano (Parametro sigma regulável, ex: 10km)
+    sigma = 10.0
+    weight_matrix = np.exp(- (dist_matrix ** 2) / (sigma ** 2))
 
-    G.add_edges_from(arestas)
-
-    # Cálculo da Matriz de Adjacência e Kernel Gaussiano
-    adj_mx = nx.to_numpy_array(G, nodelist=nos['SEGMENT_ID'], weight='weight', dtype=np.float32)
-    distancias_validas = adj_mx[adj_mx > 0]
+    # 4. Construcao Vetorizada da Conectividade Logica (Restricoes de Chicago)
+    print("Construindo restricoes logicas de cruzamento de vias...")
     
-    # Sigma dinâmico baseado no desvio padrão real da amostra
-    sigma = np.std(distancias_validas) if len(distancias_validas) > 0 else 1.0
-    sigma_sq = sigma ** 2
+    # Criamos uma matriz de indices para cruzamento
+    idx = np.arange(num_nodes)
+    idx_i, idx_j = np.meshgrid(idx, idx, indexing='ij')
 
-    mask = adj_mx > 0
-    adj_mx[mask] = np.exp(-(adj_mx[mask] ** 2) / sigma_sq)
+    # Extracao dos vetores de texto para alinhamento matricial
+    street_arr = df_nodes['STREET'].to_numpy()
+    direction_arr = df_nodes['DIRECTION'].to_numpy()
+    from_arr = df_nodes['FROM_STREET'].to_numpy()
+    to_arr = df_nodes['TO_STREET'].to_numpy()
 
-    # Esparsidade e Diagonal
-    epsilon = 0.1
-    adj_mx[adj_mx < epsilon] = 0.0
-    np.fill_diagonal(adj_mx, 1.0) 
+    # Regra Lógica 1: Continuidade na mesma via (Destino de i alimenta Origem de j)
+    mask_continuidade = (street_arr[idx_i] == street_arr[idx_j]) & \
+                        (direction_arr[idx_i] == direction_arr[idx_j]) & \
+                        (to_arr[idx_i] == from_arr[idx_j])
 
-    # Exportação
-    np.save(caminho_adj, adj_mx)
-    print(f"Matriz de adjacência {num_nos}x{num_nos} gerada e salva em: {caminho_adj}\n")
-    return True
+    # Regra Lógica 2: Intersecao de vias (A rua onde i termina cruza ou vira a rua principal de j)
+    mask_intersecao = (to_arr[idx_i] == street_arr[idx_j]) | \
+                      (from_arr[idx_j] == street_arr[idx_i])
 
+    # Fusao das regras logicas (Matriz Binaria de Conectividade)
+    logical_adjacency = (mask_continuidade | mask_intersecao).astype(np.float32)
 
-def auditar_matriz_adjacencia(caminho_matriz):
-    print("--- FASE 2: PROTOCOLO DE AUDITORIA TOPOLÓGICA ---")
-    adj = np.load(caminho_matriz)
-    num_nos = adj.shape[0]
+    # 5. Multiplicacao de Hadamard (Fusao Hibrida) e Remocao de Self-Loops
+    print("Fusao das restricoes e salvamento da matriz de adjacencia...")
+    adj_matrix = weight_matrix * logical_adjacency
     
-    # 1. Cálculo de Esparsidade Absoluta
-    total_elementos = adj.size
-    zeros = np.sum(adj == 0)
-    esparsidade = (zeros / total_elementos) * 100
-    
-    # 2. Remoção de Auto-conexões para métricas reais
-    adj_sem_diagonal = adj.copy()
-    np.fill_diagonal(adj_sem_diagonal, 0)
-    
-    # 3. Análise de Grau de Saída (Out-degree)
-    graus_saida = np.sum(adj_sem_diagonal > 0, axis=1)
-    saida_media = np.mean(graus_saida)
-    saida_mediana = np.median(graus_saida)
-    saida_max = np.max(graus_saida)
-    
-    # 4. Análise de Grau de Entrada (In-degree)
-    graus_entrada = np.sum(adj_sem_diagonal > 0, axis=0)
-    entrada_media = np.mean(graus_entrada)
-    
-    # 5. Diagnóstico de Desconexão
-    isolados_saida = np.sum(graus_saida == 0)
-    isolados_entrada = np.sum(graus_entrada == 0)
-    
-    print(f"Total de Nós (Ruas): {num_nos}")
-    print(f"Esparsidade da Matriz: {esparsidade:.2f}% (Alvo > 99%)")
-    print(f"\n[Direcionalidade de Saída - 'Para onde o tráfego vai']")
-    print(f"Grau Médio: {saida_media:.2f} | Mediana: {saida_mediana:.2f} | Máximo: {saida_max}")
-    print(f"Nós sem saída (Dead ends): {isolados_saida} ({(isolados_saida/num_nos)*100:.2f}%)")
-    
-    print(f"\n[Direcionalidade de Entrada - 'De onde o tráfego vem']")
-    print(f"Grau Médio: {entrada_media:.2f}")
-    print(f"Nós sorvedouros (Sem entrada): {isolados_entrada} ({(isolados_entrada/num_nos)*100:.2f}%)")
-    print("-" * 50)
+    # Garante que a diagonal principal seja zero (nos nao influenciam a si mesmos na convolucao espacial)
+    np.fill_diagonal(adj_matrix, 0.0)
+
+    # Salvamento do array binario
+    np.save(caminho_matrix_saida, adj_matrix)
+    print(f"Matriz de Adjacencia NxN salva com sucesso em: {caminho_matrix_saida} com formato {adj_matrix.shape}")
 
 if __name__ == "__main__":
-    # Resolução dinâmica de caminhos
-    base_dir = Path(__file__).resolve().parents[2]
-    data_dir = base_dir / "data" / "tratados"
-    
-    arquivo_csv = data_dir / "dataset_unificado.csv"
-    arquivo_adj = data_dir / "adj_mx_chicago.npy"
-    arquivo_meta = data_dir / "ordered_nodes.csv"
-    
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    # Executa o pipeline de forma sequencial
-    sucesso_geracao = gerar_matriz_adjacencia(arquivo_csv, arquivo_adj, arquivo_meta)
-    
-    if sucesso_geracao:
-        auditar_matriz_adjacencia(arquivo_adj)
+    gerar_matriz_adjacencia()

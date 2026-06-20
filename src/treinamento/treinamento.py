@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import os
@@ -12,9 +11,7 @@ from src.modelo.modelo_STGCN import STGCN_TrafficModel
 from src.preprocessamento.dataLoader import preparar_loaders_chicago
 
 def masked_mae_loss(y_pred, y_true, mask):
-    """
-    Calcula o Erro Absoluto Medio (MAE) ignorando os dados ausentes via mascara.
-    """
+    """ Calcula o Erro Absoluto Medio (MAE) ignorando os dados ausentes via mascara. """
     mask = mask.float()
     mask /= torch.mean(mask)
     mask = torch.where(torch.isnan(mask), torch.zeros_like(mask), mask)
@@ -27,6 +24,8 @@ def masked_mae_loss(y_pred, y_true, mask):
 def treinar_modelo():
     # 1. Configuracoes de Ambiente e Hardware
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Iniciando treinamento. Dispositivo alocado: {device}")
+    
     base_dir = r"C:\IC\Aplication"
     data_dir = os.path.join(base_dir, "data", "tratados")
     model_dir = os.path.join(base_dir, "src", "modelo")
@@ -35,99 +34,132 @@ def treinar_modelo():
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
-    # 2. Carregamento da Topologia e Loaders
-    adj_path = os.path.join(data_dir, "adj_mx_chicago.npy")
-    adj_mx = torch.from_numpy(np.load(adj_path)).float().to(device)
-    num_nodes = adj_mx.shape[0]
+    # 2. Carregamento de Dados e Grafo
+    print("Carregando Matriz de Adjacencia e DataLoaders...")
+    # Suposicao: O modelo STGCN exige a matriz de adjacencia na inicializacao
+    adj_mx = np.load(os.path.join(data_dir, "adj_mx.npy"))
+    adj_tensor = torch.tensor(adj_mx, dtype=torch.float32).to(device)
 
-    train_loader, val_loader, _ = preparar_loaders_chicago(data_dir, batch_size=32)
+    batch_size = 32
+    train_loader, val_loader, test_loader = preparar_loaders_chicago(data_dir, batch_size=batch_size)
 
-    # 3. Instanciacao do Modelo
+    # 3. Inicializacao do Modelo (Baseado na filtragem de 178 nos e 2 features)
     model = STGCN_TrafficModel(
-        num_nodes=num_nodes, 
+        num_nodes=178, 
         num_features=2, 
         num_timesteps_input=12, 
-        num_timesteps_output=12
+        num_timesteps_output=12,
+        adj_mx=adj_tensor # Passando a matriz estrutural calculada
     ).to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0001)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
+    # 4. Hiperparametros Otimizados
+    epochs = 100
+    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    # Scheduler: Corta o LR pela metade se nao houver melhoria na validacao por 4 epocas
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4)
 
-    # 4. Inicios do Monitoramento de Tempo
-    print(f"Iniciando treinamento: {num_nodes} nos | Dispositivo: {device}")
-    tempo_inicio_total = time.time()
-    
-    epochs = 50
+    # Parametros de Early Stopping
+    paciencia_early_stop = 12
+    epocas_sem_melhoria = 0
     best_val_loss = float('inf')
+    
     history = []
+    tempo_inicio_total = time.time()
 
+    # 5. Loop de Treinamento
     for epoch in range(epochs):
         tempo_inicio_epoca = time.time()
-        model.train()
-        train_loss = 0
         
-        for x_batch, y_batch, m_batch in train_loader:
-            x_batch, y_batch, m_batch = x_batch.to(device), y_batch.to(device), m_batch.to(device)
+        # --- FASE DE TREINO ---
+        model.train()
+        train_loss_total = 0.0
+        
+        for batch_idx, (x, y, mask) in enumerate(train_loader):
+            x = x.to(device)
+            y = y.to(device)
+            mask = mask.to(device)
 
             optimizer.zero_grad()
-            output = model(x_batch, adj_mx)
-            loss = masked_mae_loss(output, y_batch, m_batch)
+            
+            # Forward pass
+            y_pred = model(x)
+            loss = masked_mae_loss(y_pred, y, mask)
+            
+            # Backward pass
             loss.backward()
+            
+            # Contencao de Explosao de Gradiente (Gradient Clipping)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            
             optimizer.step()
-            train_loss += loss.item()
+            train_loss_total += loss.item()
+            
+            # Liberacao explicita de memoria do grafo computacional
+            del x, y, mask, y_pred, loss
 
-        # Validacao
+        train_loss_media = train_loss_total / len(train_loader)
+
+        # --- FASE DE VALIDACAO ---
         model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for x_v, y_v, m_v in val_loader:
-                x_v, y_v, m_v = x_v.to(device), y_v.to(device), m_v.to(device)
-                out_v = model(x_v, adj_mx)
-                val_loss += masked_mae_loss(out_v, y_v, m_v).item()
-
-        train_loss /= len(train_loader)
-        val_loss /= len(val_loader)
-        scheduler.step()
-
-        tempo_fim_epoca = time.time()
-        duracao_epoca = tempo_fim_epoca - tempo_inicio_epoca
+        val_loss_total = 0.0
         
-        print(f"Epoca {epoch+1:02d}/{epochs} | Loss: {train_loss:.4f} | Val: {val_loss:.4f} | Tempo: {duracao_epoca:.2f}s")
+        with torch.no_grad(): # Desliga o rastreamento de gradiente (Economia massiva de VRAM)
+            for x, y, mask in val_loader:
+                x = x.to(device)
+                y = y.to(device)
+                mask = mask.to(device)
+                
+                y_pred = model(x)
+                loss = masked_mae_loss(y_pred, y, mask)
+                val_loss_total += loss.item()
+                
+                del x, y, mask, y_pred, loss
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        val_loss_media = val_loss_total / len(val_loader)
+        
+        # Atualiza o Scheduler
+        scheduler.step(val_loss_media)
+        
+        duracao_epoca = time.time() - tempo_inicio_epoca
+
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoca [{epoch+1}/{epochs}] | Treino MAE: {train_loss_media:.4f} | Val MAE: {val_loss_media:.4f} | LR: {current_lr:.6f} | Tempo: {duracao_epoca:.1f}s")
+
+        # --- EARLY STOPPING & MODEL CHECKPOINT ---
+        if val_loss_media < best_val_loss:
+            best_val_loss = val_loss_media
+            epocas_sem_melhoria = 0
             torch.save(model.state_dict(), os.path.join(model_dir, "best_stgcn_chicago.pt"))
+            print(">>> Novo melhor modelo salvo!")
+        else:
+            epocas_sem_melhoria += 1
+            if epocas_sem_melhoria >= paciencia_early_stop:
+                print(f"\n--- Early Stopping ativado na epoca {epoch+1}. Treinamento interrompido. ---")
+                break
 
         history.append({
             'epoch': epoch+1, 
-            'train_loss': train_loss, 
-            'val_loss': val_loss,
-            'duration_sec': duracao_epoca
+            'train_loss': train_loss_media, 
+            'val_loss': val_loss_media,
+            'learning_rate': optimizer.param_groups[0]['lr']
         })
+        
+        # Limpeza agressiva de cache entre epocas para GPU limitada
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    # 5. Finalizacao e Relatorio de Tempo Total
+    # 6. Finalizacao e Salvamento dos Logs
     tempo_fim_total = time.time()
-    duracao_total_segundos = tempo_fim_total - tempo_inicio_total
-    tempo_formatado = str(timedelta(seconds=round(duracao_total_segundos)))
+    tempo_formatado = str(timedelta(seconds=round(tempo_fim_total - tempo_inicio_total)))
 
-    print("-" * 30)
-    print(f"Treinamento Concluido")
+    print("\n" + "="*40)
+    print(f"TREINAMENTO FINALIZADO")
     print(f"Tempo Total: {tempo_formatado}")
-    print("-" * 30)
+    print(f"Melhor Perda de Validacao: {best_val_loss:.4f}")
+    print("="*40)
 
-    # 6. Salvamento dos Logs de Performance
     df_history = pd.DataFrame(history)
     df_history.to_csv(os.path.join(log_dir, "history_stgcn_v2.csv"), index=False)
-    
-    # Salva resumo tecnico em arquivo de texto
-    with open(os.path.join(log_dir, "performance_summary.txt"), "w") as f:
-        f.write(f"Resumo de Performance Computacional\n")
-        f.write(f"Modelo: STGCN V2.0\n")
-        f.write(f"Total de Nos: {num_nodes}\n")
-        f.write(f"Epocas: {epochs}\n")
-        f.write(f"Tempo Total de Execucao: {tempo_formatado}\n")
-        f.write(f"Media por Epoca: {duracao_total_segundos/epochs:.2f} segundos\n")
-        f.write(f"Dispositivo: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}\n")
 
 if __name__ == "__main__":
     treinar_modelo()

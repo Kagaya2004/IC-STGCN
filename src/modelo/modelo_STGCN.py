@@ -3,9 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class TemporalConv(nn.Module):
-    """
-    Captura a evolucao do trafego no tempo usando Gated Linear Units (GLU).
-    """
+    """ Captura a evolucao do trafego no tempo usando Gated Linear Units (GLU). """
     def __init__(self, in_channels, out_channels, kernel_size=3):
         super(TemporalConv, self).__init__()
         # Saida dobrada para permitir a operacao de Gate (filtro + porta)
@@ -19,9 +17,9 @@ class TemporalConv(nn.Module):
         return p * torch.sigmoid(q)
 
 class SpatialConv(nn.Module):
-    """
-    Implementacao de Convolucao em Grafo (GCN).
-    Equacao: Z = A * X * Theta
+    """ 
+    Implementacao de Convolucao em Grafo (GCN). 
+    Equacao fundamental: Z = A * X * Theta 
     """
     def __init__(self, in_channels, out_channels):
         super(SpatialConv, self).__init__()
@@ -29,79 +27,86 @@ class SpatialConv(nn.Module):
 
     def forward(self, x, adj):
         # x shape: [Batch, Canais, Tempo, Nos]
+        # adj shape: [Nos, Nos]
         batch_size, c_in, t_steps, num_nodes = x.shape
         
-        # Reorganiza para multiplicacao de matrizes: [Batch * Tempo, Nos, Canais]
-        x = x.permute(0, 2, 3, 1).reshape(-1, num_nodes, c_in)
+        # Reorganiza para multiplicacao matricial: [Batch * Tempo, Nos, Canais]
+        x_perm = x.permute(0, 2, 3, 1).reshape(-1, num_nodes, c_in)
         
-        # Agregacao espacial baseada na Matriz de Adjacencia Ponderada
-        x = torch.matmul(adj, x)
+        # 1. Agregacao Espacial: Multiplicacao pela Matriz de Adjacencia Hibrida (A * X)
+        # adj[None, :, :] força o broadcasting para o tamanho do batch temporal
+        x_space = torch.bmm(adj.unsqueeze(0).expand(x_perm.shape[0], -1, -1), x_perm)
         
-        # Transformacao linear (Theta)
-        x = self.theta(x)
+        # 2. Transformacao Linear: Aplicacao do filtro linear (Theta)
+        z = self.theta(x_space)
         
-        # Retorna para o formato: [Batch, Canais, Tempo, Nos]
-        x = x.reshape(batch_size, t_steps, num_nodes, -1)
-        return x.permute(0, 3, 1, 2)
+        # Restaura o formato original: [Batch, Canais_Out, Tempo, Nos]
+        z = z.reshape(batch_size, t_steps, num_nodes, -1).permute(0, 3, 1, 2)
+        return F.relu(z)
 
 class STConvBlock(nn.Module):
-    """
-    Bloco Espaco-Temporal (Temporal -> Spatial -> Temporal).
-    """
+    """ Bloco Espaco-Temporal Sanduiche (Temporal -> Spatial -> Temporal). """
     def __init__(self, in_channels, hidden_channels, out_channels, num_nodes):
         super(STConvBlock, self).__init__()
         self.tmp_conv1 = TemporalConv(in_channels, hidden_channels)
         self.spa_conv = SpatialConv(hidden_channels, hidden_channels)
         self.tmp_conv2 = TemporalConv(hidden_channels, out_channels)
-        
-        # LayerNorm e Dropout para estabilizacao do treino
-        self.ln = nn.LayerNorm([out_channels, 12, num_nodes])
-        self.dropout = nn.Dropout(0.2)
-        
-        # Conexao Residual
-        self.residual = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+        self.batch_norm = nn.BatchNorm2d(out_channels)
 
     def forward(self, x, adj):
-        res = self.residual(x)
+        # Preserva identidade para conexao residual
+        residual = x 
+        
+        # Camada Temporal 1
         x = self.tmp_conv1(x)
+        # Camada Espacial (GCN) injetando a estrutura do grafo
         x = self.spa_conv(x, adj)
+        # Camada Temporal 2
         x = self.tmp_conv2(x)
-        x = self.dropout(x)
-        return self.ln(x + res)
+        
+        # Normalizacao e conexao residual para estabilizar o gradiente
+        x = self.batch_norm(x)
+        return x + residual[:, :, :x.shape[2], :]
 
 class STGCN_TrafficModel(nn.Module):
     """
     Arquitetura STGCN V2.0 otimizada para a malha central de Chicago.
+    Instancia a topologia do grafo de forma estatica via PyTorch Buffer.
     """
-    def __init__(self, num_nodes, num_features, num_timesteps_input, num_timesteps_output):
+    def __init__(self, num_nodes, num_features, num_timesteps_input, num_timesteps_output, adj_mx):
         super(STGCN_TrafficModel, self).__init__()
         
-        # Expansao de features (Velocidade + Seno da Hora) para canais internos
+        # Registra a matriz de adjacencia como buffer permanente do modelo
+        self.register_buffer('adj_mx', adj_mx)
+        
+        # Camada de projecao inicial para expansao de canais de feature
         self.input_layer = nn.Conv2d(num_features, 64, 1)
         
+        # Dois blocos convolucionais espaco-temporais profundos
         self.block1 = STConvBlock(64, 32, 64, num_nodes)
         self.block2 = STConvBlock(64, 32, 64, num_nodes)
         
-        # AJUSTE: O kernel (num_timesteps_input, 1) colapsa a dimensao temporal de entrada
-        # Isso garante que a predicao nao arraste dimensoes extras indesejadas
+        # Camada de saída para colapsar a dimensao temporal e prever o horizonte futuro
         self.output_layer = nn.Sequential(
             nn.Conv2d(64, 128, (num_timesteps_input, 1)),
             nn.ReLU(),
             nn.Conv2d(128, num_timesteps_output, 1)
         )
 
-    def forward(self, x, adj):
-        # x vindo do DataLoader: [Batch, Tempo(12), Nos(179), Canais(2)]
-        # Permuta para o padrao da convolucao: [Batch, Canais, Tempo, Nos]
+    def forward(self, x):
+        # x vindo do DataLoader: [Batch, Tempo(12), Nos(178), Canais(2)]
+        # Permuta para o padrao da convolucao do PyTorch: [Batch, Canais, Tempo, Nos]
         x = x.permute(0, 3, 1, 2)
         
+        # Projecao de atributos
         x = self.input_layer(x)
-        x = self.block1(x, adj)
-        x = self.block2(x, adj)
         
-        # Aplicacao da camada de predicao
-        x = self.output_layer(x)
+        # Propagacao espaco-temporal utilizando o buffer interno estatico
+        x = self.block1(x, self.adj_mx)
+        x = self.block2(x, self.adj_mx)
         
-        # Saida atual: [Batch, Horizon(12), 1, Nos(179)]
-        # Removemos a dimensao 2 (tempo residual) para bater com o Ground Truth [Batch, Horizon, Nos]
-        return x.squeeze(2)
+        # Geracao das predicoes lineares de velocidade
+        out = self.output_layer(x)
+        
+        # Remove a dimensao temporal residual para retornar [Batch, Horizonte(12), Nos(178)]
+        return out.squeeze(2)
