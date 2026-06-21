@@ -8,6 +8,7 @@ import os
 import sys
 import requests
 import networkx as nx
+from datetime import datetime
 from streamlit_folium import st_folium
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -31,19 +32,28 @@ def carregar_recursos_globais():
         num_nodes=len(meta), num_features=2, num_timesteps_input=12, num_timesteps_output=12, adj_mx=adj_tensor
     ).to(device)
     
+    # 4. Injeção dos parâmetros aprendidos no script de treinamento
     caminho_pesos = os.path.join(modelo_dir, "best_stgcn_chicago.pt")
     if os.path.exists(caminho_pesos):
-        model.load_state_dict(torch.load(caminho_pesos, map_location=device))
+        # Carrega o dicionário de pesos uma única vez
+        state_dict = torch.load(caminho_pesos, map_location=device)
+        model.load_state_dict(state_dict)
     else:
-        st.warning("Aviso: Pesos do modelo não localizados. Operando com inicialização aleatória.")
+        st.warning("Aviso: Pesos 'best_stgcn_chicago.pt' não localizados. Operando com pesos aleatórios.")
     model.eval()
     return model, meta
 
 def geocodificar_endereco(endereco):
+    """ Busca coordenadas lat/lon protegendo a requisição e sanitizando o input. """
     url = "https://nominatim.openstreetmap.org/search"
+    
+    # Substituição de caracteres comerciais problemáticos para o Nominatim
+    # Apenas fazemos a atribuição simples aqui
     endereco_sanitizado = endereco.replace("&", "and")
+    
     params = {'q': endereco_sanitizado + ", Chicago, IL", 'format': 'json', 'limit': 1}
-    headers = {'User-Agent': 'RouteStation_IC_Academic_Project/2.0 (academic_test@domain.com)'}
+    headers = {'User-Agent': 'RouteStation_IC_Academic_Project/3.0 (academic_test@domain.com)'}
+    
     try:
         response = requests.get(url, params=params, headers=headers)
         if response.status_code == 200 and len(response.json()) > 0:
@@ -63,7 +73,7 @@ def encontrar_no_mais_proximo(lat_usuario, lon_usuario, meta_df):
     a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
     return int(np.argmin(6371.0 * (2 * np.arcsin(np.sqrt(a)))))
 
-# --- LAYOUT STREAMLIT ---
+# --- CONFIGURAÇÃO STREAMLIT ---
 st.set_page_config(page_title="RouteStation - Painel de Controle IA", layout="wide")
 st.title("🚦 RouteStation - Roteamento Híbrido Espaço-Temporal")
 
@@ -78,7 +88,7 @@ model, meta = carregar_recursos_globais()
 
 with st.sidebar:
     st.header("📍 Itinerário de Entregas")
-    endereco_input = st.text_input("Digite um endereço ou ponto em Chicago:")
+    endereco_input = st.text_input("Digite um endereço ou cruzamento em Chicago:")
     
     if st.button("Adicionar Parada", use_container_width=True):
         if endereco_input:
@@ -98,10 +108,29 @@ with st.sidebar:
             st.markdown(f"**{idx+1}.** {p['endereco_raw']} \n *(Sensor Alvo: {p['rua_sensor']})*")
             
         st.write("---")
+        st.header("⏳ Controle de Tráfego Temporal")
+        
+        # MODO DUAL: Interface Estilo Alme Digital [HH] : [MM]
+        usar_tempo_real = st.toggle("Usar Relógio do Sistema (Tempo Real)", value=True)
+        
+        if usar_tempo_real:
+            hora_atual = datetime.now()
+            hora_calculo = hora_atual.hour
+            minuto_calculo = hora_atual.minute
+            st.success(f"Modo Produção: Analisando trânsito para às **{hora_calculo:02d}:{minuto_calculo:02d}**.")
+        else:
+            st.info("Modo Simulação Ativado")
+            st.write("Insira o horário desejado:")
+            col_h, col_m = st.columns(2)
+            with col_h:
+                hora_calculo = st.number_input("Hora (0-23)", min_value=0, max_value=23, value=10, step=1)
+            with col_m:
+                minuto_calculo = st.number_input("Minuto (0-59)", min_value=0, max_value=59, value=3, step=1)
+            st.warning(f"Simulação: Prevendo trânsito histórico das **{hora_calculo:02d}:{minuto_calculo:02d}**.")
+
         if st.button("Calcular Rota Otimizada (IA)", type="primary", use_container_width=True):
-            with st.spinner("Processando previsão espaço-temporal e acoplamento de precisão..."):
+            with st.spinner("Injetando parâmetros temporais e calculando rota..."):
                 indices_entrega = [p['idx'] for p in st.session_state.pontos]
-                # Coleta as coordenadas exatas vindas da busca do usuário
                 coordenadas_reais = [[p['lat'], p['lon']] for p in st.session_state.pontos]
                 
                 matriz_custos, rotas_coords, metricas = gerar_matriz_custos_granular(
@@ -111,7 +140,9 @@ with st.sidebar:
                     meta_path=os.path.join(data_dir, "node_metadata.csv"),
                     device=device,
                     delivery_indices=indices_entrega,
-                    coordenadas_reais_usuario=coordenadas_reais # <- INJEÇÃO DAS COORDENADAS REAIS
+                    coordenadas_reais_usuario=coordenadas_reais,
+                    hora_alvo=hora_calculo,
+                    minuto_alvo=minuto_calculo
                 )
                 
                 rota_ordem_otima = resolver_open_tsp(matriz_custos, indices_entrega)
@@ -129,9 +160,20 @@ with st.sidebar:
                         
                         if dict_coordenadas_hibridas:
                             geo_lines_lista.append(dict_coordenadas_hibridas)
+                            
+                            vel_kmh = (distancia_km / (tempo_minutos / 60.0)) if tempo_minutos > 0 else 0
+                            coord_ori = dict_coordenadas_hibridas['acesso_origem'][0]
+                            coord_dest = dict_coordenadas_hibridas['acesso_destino'][1]
+
                             itinerario_lista.append({
-                                'origem_rua': meta.iloc[origem]['STREET'], 'destino_rua': meta.iloc[destino]['STREET'],
-                                'tempo': tempo_minutos, 'distancia': distancia_km
+                                'Trecho': f"{i+1}",
+                                'Origem (Via)': meta.iloc[origem]['STREET'],
+                                'Lat/Lon Origem': f"{coord_ori[0]:.5f}, {coord_ori[1]:.5f}",
+                                'Destino (Via)': meta.iloc[destino]['STREET'],
+                                'Lat/Lon Destino': f"{coord_dest[0]:.5f}, {coord_dest[1]:.5f}",
+                                'Dist. (km)': round(distancia_km, 2),
+                                'Tempo (min)': round(tempo_minutos, 1),
+                                'Vel. IA (km/h)': round(vel_kmh, 1)
                             })
                             
                     st.session_state.itinerario = itinerario_lista
@@ -143,6 +185,7 @@ with st.sidebar:
             st.session_state.pontos = []; st.session_state.itinerario = None; st.session_state.rotas_geo = None; st.rerun()
 
 # --- CONTEÚDO VISUAL ---
+st.divider()
 coluna_esquerda_mapa, coluna_direita_metricas = st.columns([2, 1])
 
 with coluna_esquerda_mapa:
@@ -152,20 +195,9 @@ with coluna_esquerda_mapa:
     if st.session_state.rotas_geo:
         for trecho_idx, dict_coordenadas in enumerate(st.session_state.rotas_geo):
             cor_linha = PALETA_CORES[trecho_idx % len(PALETA_CORES)]
-            
-            # A Rota Animada Principal opera estritamente sob a malha de asfalto do OSMnx
-            AntPath(
-                locations=dict_coordenadas['asfalto'], color=cor_linha, weight=5, opacity=0.85, pulse_color='#FFFFFF'
-            ).add_to(mapa_folium)
-            
-            # As linhas pontilhadas agora puxam EXATAMENTE a lat/lon do endereço real e fecham o gap visual
-            folium.PolyLine(
-                locations=dict_coordenadas['acesso_origem'], color="gray", weight=3, dash_array="5, 5", opacity=0.7
-            ).add_to(mapa_folium)
-
-            folium.PolyLine(
-                locations=dict_coordenadas['acesso_destino'], color="gray", weight=3, dash_array="5, 5", opacity=0.7
-            ).add_to(mapa_folium)
+            AntPath(locations=dict_coordenadas['asfalto'], color=cor_linha, weight=5, opacity=0.85, pulse_color='#FFFFFF').add_to(mapa_folium)
+            folium.PolyLine(locations=dict_coordenadas['acesso_origem'], color="gray", weight=3, dash_array="5, 5", opacity=0.7).add_to(mapa_folium)
+            folium.PolyLine(locations=dict_coordenadas['acesso_destino'], color="gray", weight=3, dash_array="5, 5", opacity=0.7).add_to(mapa_folium)
 
     for parada_idx, p in enumerate(st.session_state.pontos):
         folium.Marker(
@@ -176,14 +208,17 @@ with coluna_esquerda_mapa:
     st_folium(mapa_folium, width=850, height=550, returned_objects=[])
 
 with coluna_direita_metricas:
-    st.subheader("Métricas Operacionais")
+    st.subheader("Métricas Globais")
     if st.session_state.itinerario:
         df_itinerario = pd.DataFrame(st.session_state.itinerario)
-        card1, card2 = st.columns(2)
-        card1.metric("Tempo Estimado Total", f"{df_itinerario['tempo'].sum():.1f} min")
-        card2.metric("Distância Percorrida", f"{df_itinerario['distancia'].sum():.2f} km")
-        st.divider()
-        for i, trecho in df_itinerario.iterrows():
-            st.info(f"**Trecho {i+1}:** {trecho['origem_rua']} ➔ {trecho['destino_rua']}\n\n⏱️ {trecho['tempo']:.1f} min | 🛣️ {trecho['distancia']:.2f} km")
+        tempo_total = df_itinerario['Tempo (min)'].sum()
+        distancia_total = df_itinerario['Dist. (km)'].sum()
+        st.metric("Tempo Estimado Total", f"{tempo_total:.1f} min")
+        st.metric("Distância Percorrida", f"{distancia_total:.2f} km")
     else:
         st.info("Aguardando cálculo de rotas.")
+
+if st.session_state.itinerario:
+    st.divider()
+    st.subheader("🔬 Tabela Analítica de Telemetria e Coordenadas")
+    st.dataframe(df_itinerario, use_container_width=True, hide_index=True)

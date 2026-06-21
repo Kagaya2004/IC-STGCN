@@ -39,10 +39,10 @@ def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_kmh):
         
     return G_osm
 
-def gerar_matriz_custos_granular(model, data_path, stats_path, meta_path, device, delivery_indices, coordenadas_reais_usuario):
+def gerar_matriz_custos_granular(model, data_path, stats_path, meta_path, device, delivery_indices, coordenadas_reais_usuario, hora_alvo=12, minuto_alvo=0):
     """
-    Motor Híbrido V2.2: Combina predição da IA com roteamento OSMnx e aplica
-    o acoplamento geométrico usando as coordenadas REAIS do estabelecimento (User-Space).
+    Motor Híbrido V2.3: Combina predição da IA com roteamento OSMnx e aplica
+    fatiamento temporal dinâmico com base no horário do sistema ou do simulador.
     """
     model.eval()
     data_dir = os.path.dirname(data_path)
@@ -52,7 +52,25 @@ def gerar_matriz_custos_granular(model, data_path, stats_path, meta_path, device
     stats = pd.read_csv(stats_path)
     meta_df = pd.read_csv(meta_path)
     
-    x_tensor = torch.tensor(data[-12:, :, :]).unsqueeze(0).to(device)
+    # --- LÓGICA DE INDICIAMENTO TEMPORAL ---
+    passos_por_hora = 6
+    passos_por_dia = 144
+    
+    # Converte HH:MM para o passo equivalente dentro do dia (Passos de 10 min)
+    step_do_dia = (hora_alvo * passos_por_hora) + (minuto_alvo // 10)
+    
+    # Seleciona um bloco estável no meio do dataset histórico para fatiamento seguro
+    dia_base = 10 
+    indice_alvo = (dia_base * passos_por_dia) + step_do_dia
+    
+    # Garante que temos 12 passos de histórico para trás, senão aplica fallback
+    if indice_alvo < 12:
+        x_input = data[-12:, :, :]
+    else:
+        x_input = data[indice_alvo-12 : indice_alvo, :, :]
+    # --------------------------------------
+    
+    x_tensor = torch.tensor(x_input).unsqueeze(0).to(device)
     with torch.no_grad():
         pred_zscore = model(x_tensor)
         
@@ -63,12 +81,10 @@ def gerar_matriz_custos_granular(model, data_path, stats_path, meta_path, device
     G_osm_base = obter_grafo_osmnx(data_dir)
     G_hibrido = construir_grafo_hibrido(G_osm_base, meta_df, pred_speed_kmh)
     
-    # Converter a lista de coordenadas reais do usuário para arrays NumPy
     coordenadas_reais_usuario = np.array(coordenadas_reais_usuario)
     delivery_lats = coordenadas_reais_usuario[:, 0]
     delivery_lons = coordenadas_reais_usuario[:, 1]
     
-    # Mapeia os nós do OSMnx mais próximos das coordenadas REAIS digitadas, e não do sensor
     osm_nodes = ox.distance.nearest_nodes(G_hibrido, X=delivery_lons, Y=delivery_lats)
     
     num_deliveries = len(delivery_indices)
@@ -77,7 +93,6 @@ def gerar_matriz_custos_granular(model, data_path, stats_path, meta_path, device
     rotas_coords = {}
     metricas = {}
     
-    # 4. Construção da submatriz de custos via caminhos mínimos de Dijkstra
     for idx_i, start_osm in enumerate(osm_nodes):
         for idx_j, end_osm in enumerate(osm_nodes):
             if start_osm == end_osm:
@@ -90,14 +105,10 @@ def gerar_matriz_custos_granular(model, data_path, stats_path, meta_path, device
                     
                     matriz_custos[idx_i, idx_j] = int(custo_minutos * 100)
                     
-                    # Coordenadas estritas da malha de rua (Onde o carro trafega)
                     coords_via = [[G_hibrido.nodes[n]['y'], G_hibrido.nodes[n]['x']] for n in caminho_osm]
-                    
-                    # CAPTURA GEOMÉTRICA CRÍTICA: Resgata a posição exata da calçada do usuário
                     coord_real_estabelecimento_origem = [delivery_lats[idx_i], delivery_lons[idx_i]]
                     coord_real_estabelecimento_destino = [delivery_lats[idx_j], delivery_lons[idx_j]]
                     
-                    # Estrutura o mapeamento visual para a interface desenhar os acessos locais pontilhados
                     rotas_coords[(delivery_indices[idx_i], delivery_indices[idx_j])] = {
                         'asfalto': coords_via,
                         'acesso_origem': [coord_real_estabelecimento_origem, coords_via[0]],
