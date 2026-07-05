@@ -1,18 +1,24 @@
 import pandas as pd
-import glob
-import os
 import numpy as np
+from pathlib import Path
 
-def unir_datasets():
-    # 1. Configuracoes de Caminho
-    base_dir = r"C:\IC\Aplication"
-    raw_dir = os.path.join(base_dir, "data", "brutos")
-    arquivo_saida = os.path.join(base_dir, "data", "tratados", "dataset_unificado.csv")
+def unir_datasets_modulares():
+    # 1. Configurações Dinâmicas de Caminho com Pathlib
+    base_dir = Path(__file__).resolve().parents[2]
+    raw_dir = base_dir / "data" / "brutos"
+    tratados_dir = base_dir / "data" / "tratados"
     
-    if not os.path.exists(os.path.dirname(arquivo_saida)):
-        os.makedirs(os.path.dirname(arquivo_saida), exist_ok=True)
+    # Garante a criação da pasta de saída
+    tratados_dir.mkdir(parents=True, exist_ok=True)
 
-    # 2. Dicionario de Sinonimos Expandido (Garantia Topologica)
+    # Dicionário mapeando as pastas de entrada para os arquivos de saída desejados
+    splits_fisicos = {
+        "treinamento": raw_dir / "data_treinamento",
+        "validacao": raw_dir / "data_validacao",
+        "teste": raw_dir / "data_teste"
+    }
+
+    # 2. Dicionário de Sinônimos Expandido (Garantia Topológica)
     mapeamento_colunas = {
         'TIME': ['TIME', '_LAST_UPDATED', 'TIMESTAMP', '_TIME', 'LAST UPDATED'],
         'SPEED': ['SPEED', '_SPEED', 'CURRENTSPEED', 'CURRENT SPEED'],
@@ -25,91 +31,99 @@ def unir_datasets():
         'START_LONGITUDE': ['START_LONGITUDE', 'START_LON', 'LONGITUDE', 'START LONGITUDE']
     }
 
-    print("Iniciando localizacao de arquivos CSV em:", raw_dir)
-    arquivos = glob.glob(os.path.join(raw_dir, "**", "*.csv"), recursive=True)
-    
-    if not arquivos:
-        print("Erro: Nenhum arquivo encontrado.")
-        return
+    # 3. Processamento Modular por Split
+    for nome_split, pasta_split in splits_fisicos.items():
+        print(f"\n[{nome_split.upper()}] Iniciando processamento em: {pasta_split}")
+        
+        if not pasta_split.exists():
+            print(f"Alerta: A pasta {pasta_split} não existe. Pulando...")
+            continue
 
-    print(f"Total de arquivos encontrados: {len(arquivos)}")
-    lista_dfs = []
-    
-    for f in arquivos:
-        nome_f = os.path.basename(f)
-        try:
-            # Resgate de arquivos com cabecalhos corrompidos
-            with open(f, 'r', encoding='utf-8-sig') as file:
-                header_line = file.readline()
-                cols_limpas = [c.replace('"', '').strip().upper() for c in header_line.split(',')]
-            
-            # Carrega arquivo como string temporariamente para evitar falhas de tipagem mista com as virgulas
-            df_temp = pd.read_csv(f, skiprows=1, names=cols_limpas, sep=',', engine='c', low_memory=False, dtype=str)
-            
-            # Mapeamento dinamico
-            mapeamento_final = {}
-            for alvo, sinonimos in mapeamento_colunas.items():
-                for s in sinonimos:
-                    if s.upper() in cols_limpas:
-                        mapeamento_final[s.upper()] = alvo
-                        break
-            
-            # Valida se todas as 9 colunas essenciais foram encontradas
-            if len(mapeamento_final) == 9:
-                # Mantem apenas colunas necessarias e descarta ruido (HOUR, BUS_COUNT, etc.)
-                df_temp = df_temp[list(mapeamento_final.keys())]
-                df_temp = df_temp.rename(columns=mapeamento_final)
-                lista_dfs.append(df_temp)
-                print(f"Arquivo mapeado: {nome_f}")
-            else:
-                faltantes = set(mapeamento_colunas.keys()) - set(mapeamento_final.values())
-                print(f"Alerta: Arquivo ignorado {nome_f}. Faltam colunas: {faltantes}")
+        arquivos = list(pasta_split.rglob("*.csv"))
+        if not arquivos:
+            print(f"Aviso: Nenhum arquivo CSV encontrado em {pasta_split}. Pulando...")
+            continue
 
-        except Exception as e:
-            print(f"Erro critico ao processar {nome_f}: {e}")
+        print(f"[{nome_split.upper()}] Total de arquivos encontrados: {len(arquivos)}")
+        lista_dfs = []
 
-    if not lista_dfs:
-        print("Erro fatal: Nenhum dado valido foi extraido para uniao.")
-        return
+        for f in arquivos:
+            nome_f = f.name
+            try:
+                # Leitura do cabeçalho
+                with open(f, 'r', encoding='utf-8-sig') as file:
+                    header_line = file.readline()
+                    cols_limpas = [c.replace('"', '').strip().upper() for c in header_line.split(',')]
+                
+                # Mapeamento dinâmico prévio
+                mapeamento_final = {}
+                for alvo, sinonimos in mapeamento_colunas.items():
+                    for s in sinonimos:
+                        if s.upper() in cols_limpas:
+                            mapeamento_final[s.upper()] = alvo
+                            break
 
-    # 3. Concatenacao Massiva
-    print("\nConcatenando todos os dados. Isso pode consumir muita RAM...")
-    df_bruto = pd.concat(lista_dfs, ignore_index=True)
+                if len(mapeamento_final) != 9:
+                    faltantes = set(mapeamento_colunas.keys()) - set(mapeamento_final.values())
+                    print(f"  -> Alerta: Arquivo ignorado {nome_f}. Faltam colunas: {faltantes}")
+                    continue
 
-    # 4. Tratamento de Formatação e Tipagem (Crucial para nao estourar memoria)
-    print("Sanitizando formato de decimais e otimizando tipos de memoria...")
-    
-    # Tratamento de Virgulas em coordenadas que vieram como string no dataset antigo
-    coords = ['START_LATITUDE', 'START_LONGITUDE']
-    for col in coords:
-        df_bruto[col] = df_bruto[col].astype(str).str.replace(',', '.')
-        df_bruto[col] = pd.to_numeric(df_bruto[col], errors='coerce').astype('float32')
+                # ==============================================================
+                # IMPLEMENTAÇÃO DE CHUNKING (Prevenção de Out-of-Memory)
+                # ==============================================================
+                chunk_tamanho = 250000  # Lê 250 mil linhas por vez
+                chunk_iter = pd.read_csv(f, skiprows=1, names=cols_limpas, sep=',', 
+                                         engine='c', low_memory=False, dtype=str, 
+                                         chunksize=chunk_tamanho)
+                
+                chunks_processados = 0
+                for df_chunk in chunk_iter:
+                    # 1. Filtra colunas
+                    df_chunk = df_chunk[list(mapeamento_final.keys())]
+                    df_chunk = df_chunk.rename(columns=mapeamento_final)
+                    
+                    # 2. Sanitização de Coordenadas
+                    coords = ['START_LATITUDE', 'START_LONGITUDE']
+                    for col in coords:
+                        df_chunk[col] = df_chunk[col].astype(str).str.replace(',', '.')
+                        df_chunk[col] = pd.to_numeric(df_chunk[col], errors='coerce').astype('float32')
 
-    df_bruto['SEGMENT_ID'] = pd.to_numeric(df_bruto['SEGMENT_ID'], errors='coerce').astype('Int32')
-    df_bruto['SPEED'] = pd.to_numeric(df_bruto['SPEED'], errors='coerce').astype('float32')
-    
-    # Textos categorizados para poupar RAM
-    cols_texto = ['STREET', 'DIRECTION', 'FROM_STREET', 'TO_STREET']
-    for col in cols_texto:
-        df_bruto[col] = df_bruto[col].astype('category')
+                    # 3. Tratamento Matemático Crítico (Velocidade e Ausências)
+                    df_chunk['SPEED'] = pd.to_numeric(df_chunk['SPEED'], errors='coerce')
+                    df_chunk['SPEED'] = df_chunk['SPEED'].replace(-1, np.nan).astype('float32')
+                    
+                    df_chunk['SEGMENT_ID'] = pd.to_numeric(df_chunk['SEGMENT_ID'], errors='coerce').astype('Int32')
+                    
+                    # 4. Otimização de Texto
+                    cols_texto = ['STREET', 'DIRECTION', 'FROM_STREET', 'TO_STREET']
+                    for col in cols_texto:
+                        df_chunk[col] = df_chunk[col].astype('category')
+                        
+                    lista_dfs.append(df_chunk)
+                    chunks_processados += 1
+                
+                print(f"  -> Arquivo processado: {nome_f} ({chunks_processados} chunks lidos)")
 
-    # 5. Tratamento Temporal Basico e Filtragem (2023-2025)
-    print("Padronizando timestamps...")
-    # Tenta inferir o formato, lidando com inconsistencias
-    df_bruto['TIME'] = pd.to_datetime(df_bruto['TIME'], format='mixed', errors='coerce')
-    df_bruto = df_bruto.dropna(subset=['TIME'])
-    
-    print("Filtrando periodo solicitado...")
-    mask_periodo = (df_bruto['TIME'] >= '2023-01-01') & (df_bruto['TIME'] <= '2025-12-31 23:59:59')
-    df_bruto = df_bruto[mask_periodo]
+            except Exception as e:
+                print(f"  -> Erro crítico ao processar {nome_f}: {e}")
 
-    # 6. Ordenacao e Salvamento
-    print("Ordenando indices espaciais e temporais...")
-    df_bruto = df_bruto.sort_values(['SEGMENT_ID', 'TIME']).reset_index(drop=True)
-    
-    print(f"Salvando dataset bruto unificado com {len(df_bruto)} linhas...")
-    df_bruto.to_csv(arquivo_saida, index=False)
-    print(f"Processo concluido. Arquivo salvo em: {arquivo_saida}")
+        if not lista_dfs:
+            print(f"[{nome_split.upper()}] Erro: Nenhum dado válido extraído.")
+            continue
+
+        # 4. Concatenação e Ordenação do Split Específico
+        print(f"[{nome_split.upper()}] Concatenando bloco...")
+        df_split = pd.concat(lista_dfs, ignore_index=True)
+
+        print(f"[{nome_split.upper()}] Padronizando tempo e ordenando...")
+        df_split['TIME'] = pd.to_datetime(df_split['TIME'], format='mixed', errors='coerce')
+        df_split = df_split.dropna(subset=['TIME'])
+        df_split = df_split.sort_values(['SEGMENT_ID', 'TIME']).reset_index(drop=True)
+        
+        # 5. Salvamento Direto
+        arquivo_saida = tratados_dir / f"{nome_split}.csv"
+        df_split.to_csv(arquivo_saida, index=False)
+        print(f"[{nome_split.upper()}] Concluído. Salvo em: {arquivo_saida} ({len(df_split)} linhas)\n")
 
 if __name__ == "__main__":
-    unir_datasets()
+    unir_datasets_modulares()
