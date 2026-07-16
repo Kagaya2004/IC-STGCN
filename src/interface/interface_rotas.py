@@ -26,11 +26,12 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 data_dir = base_dir / "data" / "tratados"
 modelo_dir = base_dir / "src" / "modelo"
 
-# UX: Paleta de Cores Hexadecimais para Segmentação
+# UX: Paleta de Cores Hexadecimais para Segmentação Semântica
 PALETA_CORES_HEX = ['#9b5de5', '#f15bb5', '#00bbf9', '#00f5d4', '#fee440', '#ff9f1c', '#e63946', '#457b9d', '#1d3557', '#2a9d8f']
 
 @st.cache_resource
 def carregar_recursos_globais():
+    """ Carrega os artefatos estáticos e os pesos da IA treinada na memória da interface. """
     meta_path = data_dir / "node_metadata.csv"
     adj_path = data_dir / "adj_mx.npy"
     data_teste_path = data_dir / "data_teste.npy"
@@ -54,6 +55,7 @@ def carregar_recursos_globais():
     return model, meta_df, adj_tensor, meta_path, data_teste_path
 
 def geocodificar_endereco(endereco):
+    """ Geocodificação protegida com User-Agent para Nominatim. """
     url = "https://nominatim.openstreetmap.org/search"
     headers = {'User-Agent': 'RouteStation_IC_Project/1.0 (StudentResearch)'}
     params = {'q': f"{endereco}, Chicago, IL", 'format': 'json', 'limit': 1}
@@ -66,6 +68,15 @@ def geocodificar_endereco(endereco):
     except Exception as e:
         st.toast(f"Erro de conexão com satélite: {e}")
     return None, None, None
+
+def calcular_distancia_haversine(lat1, lon1, lat2, lon2):
+    """ Calcula a distância física exata (em metros) entre duas coordenadas GPS. """
+    R = 6371000 # Raio da Terra em metros
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 def aplicar_jitter(coords, index):
     """ Adiciona um micro-deslocamento espacial para evitar sobreposição total nas ruas. """
@@ -108,7 +119,7 @@ with st.sidebar:
         for idx, p in enumerate(st.session_state.pontos):
             st.caption(f"{idx+1}º Parada: {p['nome']}")
 
-        if st.button("🗑️ Limpar Lista", use_container_width=True):
+        if st.button("🗑️ Limpar Lista", width='stretch'):
             st.session_state.pontos = []
             st.session_state.metricas = None
             st.rerun()
@@ -127,6 +138,7 @@ with st.sidebar:
 
                     if rota_indices:
                         tempo_total_segundos = 0
+                        distancia_total_acumulada_km = 0.0
                         CUSTO_URBANO_TRECHO_SEGUNDOS = 90
                         trechos_detalhes = []
 
@@ -136,34 +148,54 @@ with st.sidebar:
                             orig = nos_entrega[idx_atual]
                             dest = nos_entrega[idx_prox]
                             
-                            # Tempo com calibração urbana
+                            p_orig_alfinete = st.session_state.pontos[idx_atual]
+                            p_dest_alfinete = st.session_state.pontos[idx_prox]
+                            
+                            # Tempo parcial calculando atrasos fixos urbanos
                             tempo_trecho_ia = nx.shortest_path_length(G_hibrido, orig, dest, weight='weight')
                             tempo_trecho_calibrado = tempo_trecho_ia + CUSTO_URBANO_TRECHO_SEGUNDOS
                             tempo_total_segundos += tempo_trecho_calibrado
+                            minutos_trecho = int(math.ceil(tempo_trecho_calibrado / 60.0))
                             
-                            # Distância real percorrida na malha
+                            # Distância real por trecho (Malha + Access Links)
                             try:
-                                distancia_metros = nx.shortest_path_length(G_hibrido, orig, dest, weight='length')
-                                distancia_km = distancia_metros / 1000.0
+                                lat_no_orig, lon_no_orig = G_hibrido.nodes[orig]['y'], G_hibrido.nodes[orig]['x']
+                                lat_no_dest, lon_no_dest = G_hibrido.nodes[dest]['y'], G_hibrido.nodes[dest]['x']
+                                
+                                # Distância do alfinete até a rua e da rua até o alfinete destino
+                                dist_acesso_origem = calcular_distancia_haversine(p_orig_alfinete['lat'], p_orig_alfinete['lon'], lat_no_orig, lon_no_orig)
+                                dist_acesso_destino = calcular_distancia_haversine(lat_no_dest, lon_no_dest, p_dest_alfinete['lat'], p_dest_alfinete['lon'])
+                                
+                                # Distância da rua (grafo)
+                                distancia_malha_metros = nx.shortest_path_length(G_hibrido, orig, dest, weight='length')
+                                
+                                # O Total do segmento exato
+                                distancia_total_metros = distancia_malha_metros + dist_acesso_origem + dist_acesso_destino
+                                distancia_km = distancia_total_metros / 1000.0
                             except Exception:
                                 distancia_km = 0.0
+                            
+                            distancia_total_acumulada_km += distancia_km
 
                             trechos_detalhes.append({
                                 "Seq": f"{i+1}",
                                 "Trecho (Origem ➔ Destino)": f"{st.session_state.pontos[idx_atual]['nome']} ➔ {st.session_state.pontos[idx_prox]['nome']}",
                                 "Distância": f"{distancia_km:.2f} km",
-                                "Tempo": f"{int(math.ceil(tempo_trecho_calibrado / 60.0))} min"
+                                "Tempo": f"{minutos_trecho} min"
                             })
 
+                        # Cálculo global formatado para exibição lateral
                         tempo_total_minutos = tempo_total_segundos / 60.0
-                        minutos_arredondados = int(math.ceil(tempo_total_minutos))
-                        tempo_texto_final = f"{minutos_arredondados} min" if minutos_arredondados < 60 else f"{minutos_arredondados // 60} h {minutos_arredondados % 60} min"
+                        minutos_arredondados_global = int(math.ceil(tempo_total_minutos))
+                        tempo_texto_final = f"{minutos_arredondados_global} min" if minutos_arredondados_global < 60 else f"{minutos_arredondados_global // 60} h {minutos_arredondados_global % 60} min"
 
                         st.session_state.metricas = {
                             "sequencia_ideal": [st.session_state.pontos[i]['nome'] for i in rota_indices],
                             "rota_indices": rota_indices,
                             "tempo_exibicao": tempo_texto_final,
-                            "trechos_tabela": trechos_detalhes
+                            "trechos_tabela": trechos_detalhes,
+                            "distancia_total_km": distancia_total_acumulada_km,
+                            "minutos_totais": minutos_arredondados_global
                         }
                         st.rerun()
                     else:
@@ -231,7 +263,7 @@ with coluna_esquerda_mapa:
             folium.Marker(location=[p['lat'], p['lon']], popup=p['nome'],
                           icon=folium.Icon(color="black" if parada_idx == 0 else "gray", icon="play" if parada_idx == 0 else "map-marker")).add_to(mapa_folium)
 
-    st_folium(mapa_folium, use_container_width=True, height=550, returned_objects=[])
+    st_folium(mapa_folium, width=True, height=550, returned_objects=[])
 
 with coluna_direita_metricas:
     st.subheader("Métricas da Rota (IA)")
@@ -244,31 +276,56 @@ with coluna_direita_metricas:
             st.markdown(f"{prefixo} {nome}")
             
         st.divider()
-        st.write("### 🌐 Validação Externa")
-        st.info("Utilize o botão abaixo para exportar e visualizar este exato trajeto traçado diretamente no Google Maps, já com a sequência de paradas pré-configurada na ordem otimizada pela inteligência artificial.")
+        st.write("### 🗺️ Interoperabilidade Google Maps")
         
-        # LÓGICA DO BOTÃO MÁGICO (GOOGLE MAPS ROUTING URL)
         indices_otimizados = st.session_state.metricas['rota_indices']
-        
-        # Pega a partida
         p_inicio = st.session_state.pontos[indices_otimizados[0]]
-        base_url = f"https://www.google.com/maps/dir/{p_inicio['lat']},{p_inicio['lon']}/"
-        
-        # Pega os destinos em ordem
+        routing_url = f"https://www.google.com/maps/dir/{p_inicio['lat']:.6f},{p_inicio['lon']:.6f}/"
         for i in range(1, len(indices_otimizados)):
             p_atual = st.session_state.pontos[indices_otimizados[i]]
-            base_url += f"{p_atual['lat']},{p_atual['lon']}/"
+            routing_url += f"{p_atual['lat']:.6f},{p_atual['lon']:.6f}/"
             
-        st.link_button("🗺️ Exportar Trajeto para o Google Maps", url=base_url, type="primary", use_container_width=True)
+        st.link_button("🌐 Abrir Rota Completa no Google Maps", url=routing_url, type="primary", width='stretch')
 
     else:
         st.info("Insira os endereços na barra lateral e clique em Otimizar Rota.")
 
-# --- NOVO POSICIONAMENTO: PAINEL DE AUDITORIA UNIFICADO DEBAIXO DO MAPA (TELA CHEIA) ---
+# --- NOVO POSICIONAMENTO: PAINEL DE DESEMPENHO UNIFICADO (TELA CHEIA) ---
 st.divider()
-st.subheader("📋 Painel de Desempenho por Segmento")
-if st.session_state.metricas and 'trechos_tabela' in st.session_state.metricas:
-    df_trechos = pd.DataFrame(st.session_state.metricas['trechos_tabela'])
-    st.dataframe(df_trechos, hide_index=True, use_container_width=True)
-else:
-    st.caption("A tabela de desempenho será gerada após a otimização da rota.")
+coluna_tabela_esq, coluna_tabela_dir = st.columns([2, 1])
+
+with coluna_tabela_esq:
+    st.subheader("📊 Painel de Desempenho por Segmento")
+    if st.session_state.metricas and 'trechos_tabela' in st.session_state.metricas:
+        df_trechos = pd.DataFrame(st.session_state.metricas['trechos_tabela'])
+        
+        distancia_total = f"{st.session_state.metricas['distancia_total_km']:.2f} km"
+        tempo_total = f"{st.session_state.metricas['minutos_totais']} min"
+        
+        linha_total = pd.DataFrame([{
+            "Seq": "∑",
+            "Trecho (Origem ➔ Destino)": "✨ TOTAL DO PERCURSO OTIMIZADO",
+            "Distância": distancia_total,
+            "Tempo": tempo_total
+        }])
+        
+        df_final_com_totais = pd.concat([df_trechos, linha_total], ignore_index=True)
+        st.dataframe(df_final_com_totais, hide_index=True, width='stretch')
+    else:
+        st.caption("A tabela de desempenho será gerada após a otimização da rota.")
+
+with coluna_tabela_dir:
+    st.subheader("📋 Auditoria de Lat/Lon")
+    if st.session_state.pontos:
+        df_pontos = pd.DataFrame(st.session_state.pontos)
+        
+        df_pontos['Coordenadas (Ctrl+C)'] = df_pontos.apply(
+            lambda row: f"{float(row['lat']):.6f},{float(row['lon']):.6f}", axis=1
+        )
+        
+        df_auditoria = df_pontos[['nome', 'Coordenadas (Ctrl+C)']]
+        df_auditoria.columns = ['Localidade', 'Ctrl+C ➔ Google Maps']
+        
+        st.dataframe(df_auditoria, hide_index=True, width='stretch')
+    else:
+        st.caption("Insira localidades para auditar as coordenadas do GPS.")
