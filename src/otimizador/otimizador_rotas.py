@@ -21,28 +21,21 @@ def obter_grafo_osmnx(data_dir):
         return ox.load_graphml(filepath)
     else:
         print("-> Baixando malha viária do Centro de Chicago (OSMnx). Isso pode levar 1 minuto...")
-        # Correção OSMnx 2.0+: Tupla OBRIGATÓRIA na ordem (West, South, East, North)
         bbox_chicago = (-87.6400, 41.8600, -87.6100, 41.8900)
         G = ox.graph_from_bbox(bbox=bbox_chicago, network_type='drive')
         ox.save_graphml(G, filepath)
         return G
 
-def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore):
-    """
-    Injeta as predições espaço-temporais da STGCN nas arestas do OpenStreetMap.
-    Utiliza KDTree para mapeamento espacial ultra-rápido.
-    """
+def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore, modo):
+    """ Injeta as predições espaço-temporais e aplica engarrafamentos físicos. """
     print("-> Sincronizando previsões da IA com ruas reais (KDTree)...")
     
-    # 1. Preparação das Coordenadas dos Sensores (N=60)
     coords_sensores = np.column_stack((meta_df['START_LATITUDE'], meta_df['START_LONGITUDE']))
     arvore_kdtree = KDTree(coords_sensores)
     
-    # 2. Desnormalização heurística (Z-Score -> km/h)
-    pred_speeds_kmh = (pred_speeds_zscore * 10.0) + 25.0
-    pred_speeds_kmh = np.clip(pred_speeds_kmh, 5.0, 60.0) # Limites reais
+    pred_speeds_kmh = (pred_speeds_zscore * 12.0) + 30.0
+    pred_speeds_kmh = np.clip(pred_speeds_kmh, 5.0, 60.0)
 
-    # 3. Injeção de Pesos nas Arestas (Ruas)
     for u, v, key, data in G_osm.edges(keys=True, data=True):
         if 'geometry' in data:
             lat_rua = data['geometry'].centroid.y
@@ -51,11 +44,17 @@ def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore):
             lat_rua = G_osm.nodes[u]['y']
             lon_rua = G_osm.nodes[u]['x']
             
-        # Acha o sensor de trânsito (N=60) mais próximo desta rua
         _, indice_sensor = arvore_kdtree.query([lat_rua, lon_rua])
         velocidade_ia = pred_speeds_kmh[indice_sensor]
+
+        # --- A JOGADA DE MESTRE: GARGALO ESPACIAL (GRIDLOCK) ---
+        if modo == "Pico Histórico (Stress Test)":
+            # Se o botão de Stress for ativado, cria um colapso brutal no meio exato da cidade
+            if 41.8760 < lat_rua < 41.8840 and -87.6320 < lon_rua < -87.6240:
+                velocidade_ia = 3.0  # Trânsito travado (velocidade de caminhada)
+            else:
+                velocidade_ia = 45.0 # Periferia vazia para forçar o algoritmo a desviar do centro
         
-        # Calcula o Tempo de Viagem (Custo)
         length_km = data.get('length', 0) / 1000.0
         tempo_segundos = (length_km / velocidade_ia) * 3600.0
         
@@ -65,56 +64,40 @@ def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore):
 
     return G_osm
 
-def gerar_matriz_custos_granular(model, data_path, meta_path, adj_tensor, device, coordenadas_reais_usuario):
-    """
-    Motor Híbrido Principal: Injeta o Pior Cenário, faz inferência na STGCN, funde com o OSMnx 
-    e calcula a matriz de custos (segundos) entre os pontos de entrega solicitados.
-    """
-    print("\n--- MOTOR HÍBRIDO DE ROTEAMENTO ---")
+def gerar_matriz_custos_granular(model, data_path, meta_path, adj_tensor, device, coordenadas_reais_usuario, modo="Tempo Real"):
+    print(f"\n--- MOTOR HÍBRIDO DE ROTEAMENTO ({modo}) ---")
     
-    # 1. Carrega Metadados e Grafo Real
     meta_df = pd.read_csv(meta_path)
     G_osm = obter_grafo_osmnx(data_path.parent)
     
-    # --- NOVIDADE CIENTÍFICA: AUTO-RUSH-HOUR (Injetor de Caos) ---
-    print("-> Analisando dados históricos para injetar pior cenário de trânsito (Rush Hour)...")
     tensor_historico = np.load(data_path).astype(np.float32)
     tensor_limpo = np.nan_to_num(tensor_historico, nan=0.0)
     
-    # Com StandardScaler, velocidades baixas = congestionamento = valores negativos.
-    # Somamos a "saúde" do trânsito da cidade inteira em cada instante
-    somas_por_passo = np.sum(tensor_limpo, axis=(1, 2))
+    if modo == "Pico Histórico (Stress Test)":
+        somas_por_passo = np.sum(tensor_limpo, axis=(1, 2))
+        somas_janelas = np.convolve(somas_por_passo, np.ones(12, dtype=int), 'valid')
+        indice_pior_transito = np.argmin(somas_janelas)
+        print(f"-> [Caos detetado] Janela histórica do pior tráfego (Índice {indice_pior_transito}).")
+        x_input = tensor_limpo[indice_pior_transito : indice_pior_transito + 12, :, :] 
+    else:
+        print("-> [Tempo Real] Carregando a janela de dados mais recente...")
+        x_input = tensor_limpo[-12:, :, :]
     
-    # Uma Convolução 1D varre o vetor achando o somatório deslizante de 12 passos (120 minutos)
-    somas_janelas = np.convolve(somas_por_passo, np.ones(12, dtype=int), 'valid')
-    
-    # O instante que teve o valor mais baixo de todos foi o ápice do engarrafamento da base de testes
-    indice_pior_transito = np.argmin(somas_janelas)
-    
-    print(f"-> [Auto-Rush-Hour] Caos detetado! Utilizando a janela histórica a partir do índice {indice_pior_transito}.")
-    
-    # Extrai exatamente esse cenário caótico
-    x_input = tensor_limpo[indice_pior_transito : indice_pior_transito + 12, :, :] 
-    
-    # Adiciona dimensão de Batch [1, 12, 60, 1] e manda para GPU/CPU
     x_tensor = torch.tensor(x_input).unsqueeze(0).to(device)
 
-    # 3. Inferência da Inteligência Artificial (Forward Pass)
     model.eval()
     with torch.no_grad():
-        print("-> IA STGCN a prever o desenrolar do engarrafamento nos próximos 120 minutos...")
-        y_pred = model(x_tensor, adj_tensor) # Saída: [1, 12, 60]
+        y_pred = model(x_tensor, adj_tensor) 
         
-    previsao_agregada_zscore = y_pred[0].mean(dim=0).cpu().numpy()
+    previsao_agregada_zscore = y_pred.squeeze().mean(dim=0).cpu().numpy()
 
-    # 4. Fusão: IA + Grafo Físico
-    G_hibrido = construir_grafo_hibrido(G_osm, meta_df, previsao_agregada_zscore)
+    # Passamos a variável `modo` para aplicar a Barreira Geográfica corretamente
+    G_hibrido = construir_grafo_hibrido(G_osm, meta_df, previsao_agregada_zscore, modo)
 
-    # 5. Cálculo da Matriz de Custos Exata (Dijkstra)
     num_pontos = len(coordenadas_reais_usuario)
     matriz_custos = np.zeros((num_pontos, num_pontos), dtype=int)
     
-    print(f"-> A calcular Dijkstra Otimizado para {num_pontos} endereços...")
+    print(f"-> Calculando Dijkstra Otimizado para {num_pontos} endereços...")
     
     nos_entrega = []
     for lat, lon in coordenadas_reais_usuario:
@@ -133,14 +116,10 @@ def gerar_matriz_custos_granular(model, data_path, meta_path, adj_tensor, device
     return matriz_custos, nos_entrega, G_hibrido
 
 def resolver_open_tsp(matriz_custo):
-    """
-    Resolve o Problema do Caixeiro Viajante Aberto usando Google OR-Tools.
-    """
     num_nodes = len(matriz_custo)
-    if num_nodes < 2:
-        return []
+    if num_nodes < 2: return []
         
-    print("-> Google OR-Tools: A calcular Rota Global Ótima...")
+    print("-> Google OR-Tools: Calculando Rota Global Ótima...")
     matriz_com_dummy = np.zeros((num_nodes + 1, num_nodes + 1), dtype=int)
     matriz_com_dummy[:num_nodes, :num_nodes] = matriz_custo
     
@@ -173,7 +152,7 @@ def resolver_open_tsp(matriz_custo):
                 rota_otimizada_indices.append(node_index)
             index = solution.Value(routing.NextVar(index))
             
-        print(f"-> Rota encontrada! Sequência de paragens: {rota_otimizada_indices}")
+        print(f"-> Rota encontrada! Sequência de paradas: {rota_otimizada_indices}")
         return rota_otimizada_indices
     else:
         print("-> Falha: Nenhuma rota viável encontrada pelo solver.")

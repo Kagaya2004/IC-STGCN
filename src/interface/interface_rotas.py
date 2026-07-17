@@ -31,7 +31,6 @@ PALETA_CORES_HEX = ['#9b5de5', '#f15bb5', '#00bbf9', '#00f5d4', '#fee440', '#ff9
 
 @st.cache_resource
 def carregar_recursos_globais():
-    """ Carrega os artefatos estáticos e os pesos da IA treinada na memória da interface. """
     meta_path = data_dir / "node_metadata.csv"
     adj_path = data_dir / "adj_mx.npy"
     data_teste_path = data_dir / "data_teste.npy"
@@ -55,7 +54,6 @@ def carregar_recursos_globais():
     return model, meta_df, adj_tensor, meta_path, data_teste_path
 
 def geocodificar_endereco(endereco):
-    """ Geocodificação protegida com User-Agent para Nominatim. """
     url = "https://nominatim.openstreetmap.org/search"
     headers = {'User-Agent': 'RouteStation_IC_Project/1.0 (StudentResearch)'}
     params = {'q': f"{endereco}, Chicago, IL", 'format': 'json', 'limit': 1}
@@ -70,8 +68,7 @@ def geocodificar_endereco(endereco):
     return None, None, None
 
 def calcular_distancia_haversine(lat1, lon1, lat2, lon2):
-    """ Calcula a distância física exata (em metros) entre duas coordenadas GPS. """
-    R = 6371000 # Raio da Terra em metros
+    R = 6371000 
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
@@ -79,7 +76,6 @@ def calcular_distancia_haversine(lat1, lon1, lat2, lon2):
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 def aplicar_jitter(coords, index):
-    """ Adiciona um micro-deslocamento espacial para evitar sobreposição total nas ruas. """
     jitter = 0.00004 * (index % 4)
     return [[c[0] + jitter, c[1] + jitter] for c in coords]
 
@@ -97,6 +93,17 @@ if 'metricas' not in st.session_state:
 model, meta_df, adj_tensor, meta_path, data_teste_path = carregar_recursos_globais()
 
 with st.sidebar:
+    st.header("⚙️ Configurações de Cenário")
+    modo_simulacao = st.radio(
+        "Selecione o Modo de Tráfego:",
+        ("Tempo Real", "Pico Histórico (Stress Test)"),
+        help="O 'Pico Histórico' aplica penalidades críticas no centro financeiro de Chicago."
+    )
+    # A atualização dinâmica do modo!
+    st.session_state.modo_trafego = modo_simulacao
+
+    st.divider()
+
     st.header("📍 Itinerário de Entregas")
 
     endereco_input = st.text_input("Adicionar Endereço (The Loop, Chicago):", placeholder="Ex: Willis Tower")
@@ -127,11 +134,12 @@ with st.sidebar:
         st.divider()
         if len(st.session_state.pontos) >= 2:
             if st.button("🚀 Otimizar Rota (IA)", type="primary", width='stretch'):
-                with st.spinner("Invocando STGCN e Solver OR-Tools..."):
+                with st.spinner(f"Processando sob condições de: {st.session_state.modo_trafego}..."):
                     coordenadas = [(p['lat'], p['lon']) for p in st.session_state.pontos]
 
+                    # A injeção do modo direto no backend!
                     matriz_custo, nos_entrega, G_hibrido = gerar_matriz_custos_granular(
-                        model, data_teste_path, meta_path, adj_tensor, device, coordenadas
+                        model, data_teste_path, meta_path, adj_tensor, device, coordenadas, st.session_state.modo_trafego
                     )
 
                     rota_indices = resolver_open_tsp(matriz_custo)
@@ -151,25 +159,19 @@ with st.sidebar:
                             p_orig_alfinete = st.session_state.pontos[idx_atual]
                             p_dest_alfinete = st.session_state.pontos[idx_prox]
                             
-                            # Tempo parcial calculando atrasos fixos urbanos
                             tempo_trecho_ia = nx.shortest_path_length(G_hibrido, orig, dest, weight='weight')
                             tempo_trecho_calibrado = tempo_trecho_ia + CUSTO_URBANO_TRECHO_SEGUNDOS
                             tempo_total_segundos += tempo_trecho_calibrado
                             minutos_trecho = int(math.ceil(tempo_trecho_calibrado / 60.0))
                             
-                            # Distância real por trecho (Malha + Access Links)
                             try:
                                 lat_no_orig, lon_no_orig = G_hibrido.nodes[orig]['y'], G_hibrido.nodes[orig]['x']
                                 lat_no_dest, lon_no_dest = G_hibrido.nodes[dest]['y'], G_hibrido.nodes[dest]['x']
                                 
-                                # Distância do alfinete até a rua e da rua até o alfinete destino
                                 dist_acesso_origem = calcular_distancia_haversine(p_orig_alfinete['lat'], p_orig_alfinete['lon'], lat_no_orig, lon_no_orig)
                                 dist_acesso_destino = calcular_distancia_haversine(lat_no_dest, lon_no_dest, p_dest_alfinete['lat'], p_dest_alfinete['lon'])
-                                
-                                # Distância da rua (grafo)
                                 distancia_malha_metros = nx.shortest_path_length(G_hibrido, orig, dest, weight='length')
                                 
-                                # O Total do segmento exato
                                 distancia_total_metros = distancia_malha_metros + dist_acesso_origem + dist_acesso_destino
                                 distancia_km = distancia_total_metros / 1000.0
                             except Exception:
@@ -184,7 +186,6 @@ with st.sidebar:
                                 "Tempo": f"{minutos_trecho} min"
                             })
 
-                        # Cálculo global formatado para exibição lateral
                         tempo_total_minutos = tempo_total_segundos / 60.0
                         minutos_arredondados_global = int(math.ceil(tempo_total_minutos))
                         tempo_texto_final = f"{minutos_arredondados_global} min" if minutos_arredondados_global < 60 else f"{minutos_arredondados_global // 60} h {minutos_arredondados_global % 60} min"
@@ -263,7 +264,7 @@ with coluna_esquerda_mapa:
             folium.Marker(location=[p['lat'], p['lon']], popup=p['nome'],
                           icon=folium.Icon(color="black" if parada_idx == 0 else "gray", icon="play" if parada_idx == 0 else "map-marker")).add_to(mapa_folium)
 
-    st_folium(mapa_folium, width=True, height=550, returned_objects=[])
+    st_folium(mapa_folium, width='stretch', height=550, returned_objects=[])
 
 with coluna_direita_metricas:
     st.subheader("Métricas da Rota (IA)")
