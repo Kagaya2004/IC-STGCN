@@ -13,20 +13,18 @@ import streamlit as st
 from streamlit_folium import st_folium
 from pathlib import Path
 
-# 1. Configuração Dinâmica de Módulos (Blindagem de Caminhos)
+# 1. Configuração Dinâmica de Módulos
 base_dir = Path(__file__).resolve().parents[2]
 sys.path.append(str(base_dir))
 
 from src.modelo.modelo_STGCN import STGCN_TrafficModel
 from src.otimizador.otimizador_rotas import gerar_matriz_custos_granular, resolver_open_tsp
 
-# Configuração de Hardware Segura
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 data_dir = base_dir / "data" / "tratados"
 modelo_dir = base_dir / "src" / "modelo"
 
-# UX: Paleta de Cores Hexadecimais para Segmentação Semântica
 PALETA_CORES_HEX = ['#9b5de5', '#f15bb5', '#00bbf9', '#00f5d4', '#fee440', '#ff9f1c', '#e63946', '#457b9d', '#1d3557', '#2a9d8f']
 
 @st.cache_resource
@@ -75,15 +73,36 @@ def calcular_distancia_haversine(lat1, lon1, lat2, lon2):
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-def aplicar_jitter(coords, index):
-    jitter = 0.00004 * (index % 4)
-    return [[c[0] + jitter, c[1] + jitter] for c in coords]
+def obter_caminho_detalhado_sem_cortes(G_osm, path_nodes):
+    """ Extrai a curva perfeita das ruas estritamente sobre o asfalto, sem cortes. """
+    coords_rua = []
+    for i in range(len(path_nodes) - 1):
+        u = path_nodes[i]
+        v = path_nodes[i+1]
+        edge_data = G_osm.get_edge_data(u, v)
+        
+        if edge_data is not None:
+            key_min = min(edge_data.keys(), key=lambda k: edge_data[k].get('length', 1e9))
+            dados_aresta = edge_data[key_min]
+            
+            if 'geometry' in dados_aresta:
+                curvas = list(dados_aresta['geometry'].coords)
+                coords_rua.extend([[lat, lon] for lon, lat in curvas[:-1]])
+            else:
+                coords_rua.append([G_osm.nodes[u]['y'], G_osm.nodes[u]['x']])
+        else:
+            coords_rua.append([G_osm.nodes[u]['y'], G_osm.nodes[u]['x']])
+            
+    last_node = path_nodes[-1]
+    coords_rua.append([G_osm.nodes[last_node]['y'], G_osm.nodes[last_node]['x']])
+    
+    return coords_rua
 
 # --- CONFIGURAÇÃO STREAMLIT ---
 st.set_page_config(page_title="RouteStation - Painel IA", layout="wide", page_icon="🚦")
 
 st.title("🚦 RouteStation - Roteamento Híbrido Ciberfísico")
-st.markdown("Integração **STGCN (Inteligência Artificial)** com **OpenStreetMap (Grafo Espacial)**.")
+st.markdown("Integração **STGCN (Inteligência Artificial Espaço-Temporal)** com **OpenStreetMap (Grafo Topológico)**.")
 
 if 'pontos' not in st.session_state:
     st.session_state.pontos = []
@@ -97,13 +116,11 @@ with st.sidebar:
     modo_simulacao = st.radio(
         "Selecione o Modo de Tráfego:",
         ("Tempo Real", "Pico Histórico (Stress Test)"),
-        help="O 'Pico Histórico' aplica penalidades críticas no centro financeiro de Chicago."
+        help="O 'Pico Histórico' extrai a janela de maior assimetria histórica e aplica Temperature Scaling."
     )
-    # A atualização dinâmica do modo!
     st.session_state.modo_trafego = modo_simulacao
 
     st.divider()
-
     st.header("📍 Itinerário de Entregas")
 
     endereco_input = st.text_input("Adicionar Endereço (The Loop, Chicago):", placeholder="Ex: Willis Tower")
@@ -111,7 +128,7 @@ with st.sidebar:
         if endereco_input:
             lat, lon, nome_oficial = geocodificar_endereco(endereco_input)
             if lat and lon:
-                if 41.8600 <= lat <= 41.8900 and -87.6400 <= lon <= -87.6100:
+                if 41.8600 <= lat <= 41.8900 and -87.6450 <= lon <= -87.6100:
                     st.session_state.pontos.append({'lat': lat, 'lon': lon, 'nome': nome_oficial.split(',')[0]})
                     st.success("Adicionado com sucesso!")
                     st.rerun()
@@ -126,18 +143,17 @@ with st.sidebar:
         for idx, p in enumerate(st.session_state.pontos):
             st.caption(f"{idx+1}º Parada: {p['nome']}")
 
-        if st.button("🗑️ Limpar Lista", width='stretch'):
+        if st.button("🗑️ Limpar Lista", use_container_width=True):
             st.session_state.pontos = []
             st.session_state.metricas = None
             st.rerun()
 
         st.divider()
         if len(st.session_state.pontos) >= 2:
-            if st.button("🚀 Otimizar Rota (IA)", type="primary", width='stretch'):
-                with st.spinner(f"Processando sob condições de: {st.session_state.modo_trafego}..."):
+            if st.button("🚀 Otimizar Rota (IA)", type="primary", use_container_width=True):
+                with st.spinner(f"Invocando STGCN sob condições de {st.session_state.modo_trafego}..."):
                     coordenadas = [(p['lat'], p['lon']) for p in st.session_state.pontos]
 
-                    # A injeção do modo direto no backend!
                     matriz_custo, nos_entrega, G_hibrido = gerar_matriz_custos_granular(
                         model, data_teste_path, meta_path, adj_tensor, device, coordenadas, st.session_state.modo_trafego
                     )
@@ -155,28 +171,28 @@ with st.sidebar:
                             idx_prox = rota_indices[i+1]
                             orig = nos_entrega[idx_atual]
                             dest = nos_entrega[idx_prox]
-                            
+
                             p_orig_alfinete = st.session_state.pontos[idx_atual]
                             p_dest_alfinete = st.session_state.pontos[idx_prox]
-                            
+
                             tempo_trecho_ia = nx.shortest_path_length(G_hibrido, orig, dest, weight='weight')
                             tempo_trecho_calibrado = tempo_trecho_ia + CUSTO_URBANO_TRECHO_SEGUNDOS
                             tempo_total_segundos += tempo_trecho_calibrado
                             minutos_trecho = int(math.ceil(tempo_trecho_calibrado / 60.0))
-                            
+
                             try:
                                 lat_no_orig, lon_no_orig = G_hibrido.nodes[orig]['y'], G_hibrido.nodes[orig]['x']
                                 lat_no_dest, lon_no_dest = G_hibrido.nodes[dest]['y'], G_hibrido.nodes[dest]['x']
-                                
+
                                 dist_acesso_origem = calcular_distancia_haversine(p_orig_alfinete['lat'], p_orig_alfinete['lon'], lat_no_orig, lon_no_orig)
                                 dist_acesso_destino = calcular_distancia_haversine(lat_no_dest, lon_no_dest, p_dest_alfinete['lat'], p_dest_alfinete['lon'])
                                 distancia_malha_metros = nx.shortest_path_length(G_hibrido, orig, dest, weight='length')
-                                
+
                                 distancia_total_metros = distancia_malha_metros + dist_acesso_origem + dist_acesso_destino
                                 distancia_km = distancia_total_metros / 1000.0
                             except Exception:
                                 distancia_km = 0.0
-                            
+
                             distancia_total_acumulada_km += distancia_km
 
                             trechos_detalhes.append({
@@ -202,7 +218,7 @@ with st.sidebar:
                     else:
                         st.error("O Solver não localizou uma rota matematicamente viável.")
 
-# --- CONTEÚDO VISUAL (MAPA HÍBRIDO) ---
+# --- MAPA INTERATIVO E MÉTRICAS ---
 st.divider()
 coluna_esquerda_mapa, coluna_direita_metricas = st.columns([2, 1])
 
@@ -211,10 +227,11 @@ with coluna_esquerda_mapa:
     mapa_folium = folium.Map(location=[41.8781, -87.6298], zoom_start=14, tiles="cartodbpositron")
 
     if st.session_state.metricas and 'rota_indices' in st.session_state.metricas:
-        with st.spinner("Traçando caminhos com Ancoragem Exata..."):
+        with st.spinner("Projetando geometria perfeita no asfalto..."):
             try:
                 G_osm = ox.load_graphml(data_dir / "chicago_map.graphml")
                 coordenadas = [(p['lat'], p['lon']) for p in st.session_state.pontos]
+                # Ancoragem estrita baseada em NÓS (Esquinas) para evitar que o algoritmo corte os prédios
                 nos_entrega = ox.distance.nearest_nodes(G_osm, X=[p[1] for p in coordenadas], Y=[p[0] for p in coordenadas])
             except Exception:
                 st.error("Erro Crítico: Malha viária GraphML ausente.")
@@ -229,18 +246,29 @@ with coluna_esquerda_mapa:
                 p_orig_exato, p_dest_exato = st.session_state.pontos[orig_idx], st.session_state.pontos[dest_idx]
 
                 try:
+                    # 1. Dijkstra puramente sobre os nós reais da rua
                     path_nodes = nx.shortest_path(G_osm, orig_osm, dest_osm, weight='length')
-                    coords_puras = [[G_osm.nodes[node]['y'], G_osm.nodes[node]['x']] for node in path_nodes]
-                    coords_jittered = aplicar_jitter(coords_puras, i)
-                    coords_finais = [[p_orig_exato['lat'], p_orig_exato['lon']]] + coords_jittered + [[p_dest_exato['lat'], p_dest_exato['lon']]]
+                    
+                    # 2. Extração limpa (Sem Jitter, 100% no asfalto)
+                    coords_rua = obter_caminho_detalhado_sem_cortes(G_osm, path_nodes)
 
-                    espessura_linha = max(7 - (i * 1.5), 3)
+                    # 3. Espessura em Cascata: cria o efeito 'Neon' para rotas sobrepostas
+                    espessura_linha = max(9 - (i * 2), 3)
                     cor_atual = PALETA_CORES_HEX[i % len(PALETA_CORES_HEX)]
 
+                    # Desenha o fluxo Veicular
                     AntPath(
-                        locations=coords_finais, color=cor_atual, weight=espessura_linha,
-                        opacity=0.80, dash_array=[12, 24], pulse_color="#ffffff", delay=550
+                        locations=coords_rua, color=cor_atual, weight=espessura_linha,
+                        opacity=0.9, dash_array=[12, 24], pulse_color="#ffffff", delay=550
                     ).add_to(mapa_folium)
+
+                    # 4. Access Links (Conexão pontilhada de pedestre da esquina até o alfinete exato do prédio)
+                    folium.PolyLine([[p_orig_exato['lat'], p_orig_exato['lon']], coords_rua[0]],
+                                    color="#6c757d", weight=2, dash_array="4, 6", opacity=0.8).add_to(mapa_folium)
+                                    
+                    folium.PolyLine([coords_rua[-1], [p_dest_exato['lat'], p_dest_exato['lon']]],
+                                    color="#6c757d", weight=2, dash_array="4, 6", opacity=0.8).add_to(mapa_folium)
+
                 except nx.NetworkXNoPath:
                     pass
 
@@ -264,7 +292,7 @@ with coluna_esquerda_mapa:
             folium.Marker(location=[p['lat'], p['lon']], popup=p['nome'],
                           icon=folium.Icon(color="black" if parada_idx == 0 else "gray", icon="play" if parada_idx == 0 else "map-marker")).add_to(mapa_folium)
 
-    st_folium(mapa_folium, width='stretch', height=550, returned_objects=[])
+    st_folium(mapa_folium, use_container_width=True, height=550, returned_objects=[])
 
 with coluna_direita_metricas:
     st.subheader("Métricas da Rota (IA)")
@@ -275,23 +303,23 @@ with coluna_direita_metricas:
         for i, nome in enumerate(st.session_state.metricas['sequencia_ideal']):
             prefixo = "**🟢 Partida:**" if i == 0 else ("**🏁 Destino Final:**" if i == len(st.session_state.metricas['sequencia_ideal']) - 1 else f"**📍 Entrega {i}:**")
             st.markdown(f"{prefixo} {nome}")
-            
+
         st.divider()
         st.write("### 🗺️ Interoperabilidade Google Maps")
-        
+
         indices_otimizados = st.session_state.metricas['rota_indices']
         p_inicio = st.session_state.pontos[indices_otimizados[0]]
         routing_url = f"https://www.google.com/maps/dir/{p_inicio['lat']:.6f},{p_inicio['lon']:.6f}/"
         for i in range(1, len(indices_otimizados)):
             p_atual = st.session_state.pontos[indices_otimizados[i]]
             routing_url += f"{p_atual['lat']:.6f},{p_atual['lon']:.6f}/"
-            
-        st.link_button("🌐 Abrir Rota Completa no Google Maps", url=routing_url, type="primary", width='stretch')
+
+        st.link_button("🌐 Abrir Rota Completa no Google Maps", url=routing_url, type="primary", use_container_width=True)
 
     else:
         st.info("Insira os endereços na barra lateral e clique em Otimizar Rota.")
 
-# --- NOVO POSICIONAMENTO: PAINEL DE DESEMPENHO UNIFICADO (TELA CHEIA) ---
+# --- PAINEL DE DESEMPENHO E AUDITORIA ---
 st.divider()
 coluna_tabela_esq, coluna_tabela_dir = st.columns([2, 1])
 
@@ -299,17 +327,17 @@ with coluna_tabela_esq:
     st.subheader("📊 Painel de Desempenho por Segmento")
     if st.session_state.metricas and 'trechos_tabela' in st.session_state.metricas:
         df_trechos = pd.DataFrame(st.session_state.metricas['trechos_tabela'])
-        
+
         distancia_total = f"{st.session_state.metricas['distancia_total_km']:.2f} km"
         tempo_total = f"{st.session_state.metricas['minutos_totais']} min"
-        
+
         linha_total = pd.DataFrame([{
             "Seq": "∑",
             "Trecho (Origem ➔ Destino)": "✨ TOTAL DO PERCURSO OTIMIZADO",
             "Distância": distancia_total,
             "Tempo": tempo_total
         }])
-        
+
         df_final_com_totais = pd.concat([df_trechos, linha_total], ignore_index=True)
         st.dataframe(df_final_com_totais, hide_index=True, width='stretch')
     else:
@@ -319,14 +347,14 @@ with coluna_tabela_dir:
     st.subheader("📋 Auditoria de Lat/Lon")
     if st.session_state.pontos:
         df_pontos = pd.DataFrame(st.session_state.pontos)
-        
+
         df_pontos['Coordenadas (Ctrl+C)'] = df_pontos.apply(
             lambda row: f"{float(row['lat']):.6f},{float(row['lon']):.6f}", axis=1
         )
-        
+
         df_auditoria = df_pontos[['nome', 'Coordenadas (Ctrl+C)']]
         df_auditoria.columns = ['Localidade', 'Ctrl+C ➔ Google Maps']
-        
+
         st.dataframe(df_auditoria, hide_index=True, width='stretch')
     else:
         st.caption("Insira localidades para auditar as coordenadas do GPS.")

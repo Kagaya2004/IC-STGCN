@@ -1,0 +1,112 @@
+import torch
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import sys
+
+# CORREÇÃO: "Sobe" dois níveis para chegar à raiz do projeto (C:\IC\Aplication)
+base_dir = Path(__file__).resolve().parents[2]
+sys.path.append(str(base_dir))
+
+from src.modelo.modelo_STGCN import STGCN_TrafficModel
+from src.preprocessamento.dataLoader import ChicagoTrafficDataset
+
+def masked_mae_numpy(y_pred, y_true, mask):
+    """ Calcula o Erro Absoluto Médio usando NumPy, ignorando os NaNs originais """
+    mask = mask.astype(np.float32)
+    mask_sum = np.sum(mask)
+    if mask_sum == 0:
+        return 0.0
+    loss = np.abs(y_pred - y_true) * mask
+    return np.sum(loss) / mask_sum
+
+def extrair_comparativo_cientifico():
+    print("Iniciando Extração de Métricas (STGCN vs Média Histórica)...")
+    
+    # 1. Configuração de Caminhos usando a raiz correta
+    data_dir = base_dir / "data" / "tratados"
+    modelo_dir = base_dir / "src" / "modelo"
+    
+    caminho_dados_teste = data_dir / "data_teste.npy"
+    caminho_mask_teste = data_dir / "mask_teste.npy"
+    caminho_pesos = modelo_dir / "stgcn_pesos_chicago.pth"
+    caminho_meta = data_dir / "node_metadata.csv"
+    caminho_adj = data_dir / "adj_mx.npy"
+    
+    # 2. Carrega Dados de Teste
+    dataset_teste = ChicagoTrafficDataset(caminho_dados_teste, caminho_mask_teste, window_size=12, horizon=12)
+    
+    meta_df = pd.read_csv(caminho_meta)
+    num_nodes = len(meta_df)
+    
+    # 3. Inicializa o Modelo STGCN
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = STGCN_TrafficModel(in_channels=1, hidden_channels=64, out_channels=12, num_nodes=num_nodes).to(device)
+    model.load_state_dict(torch.load(caminho_pesos, map_location=device, weights_only=True))
+    model.eval()
+    
+    adj_mx = np.load(caminho_adj)
+    adj_tensor = torch.tensor(adj_mx, dtype=torch.float32).to(device)
+    
+    # 4. Acumuladores de Erro
+    stgcn_maes = []
+    ha_maes = []
+    
+    print(f"Calculando inferências sobre {len(dataset_teste)} janelas de teste...")
+    
+    # 5. O Loop de Teste Comparativo
+    with torch.no_grad():
+        for i in range(len(dataset_teste)):
+            x_tensor, y_tensor, mask_tensor = dataset_teste[i]
+            
+            x_input = x_tensor.unsqueeze(0).to(device)
+            
+            # --- MODELO A: STGCN (IA) ---
+            y_pred_stgcn = model(x_input, adj_tensor).squeeze(0).cpu().numpy()
+            
+            # --- MODELO B: Média Histórica (HA - Modelo Burro) ---
+            x_numpy = x_tensor.numpy().squeeze(-1) 
+            mask_x = (~np.isclose(x_numpy, 0.0)).astype(np.float32)
+            soma_historica = np.sum(x_numpy, axis=0)
+            contagem_validos = np.sum(mask_x, axis=0)
+            
+            media_historica_por_via = np.divide(soma_historica, contagem_validos, out=np.zeros_like(soma_historica), where=contagem_validos!=0)
+            y_pred_ha = np.tile(media_historica_por_via, (12, 1)) 
+            
+            # --- COMPARAÇÃO ESTATÍSTICA ---
+            y_true_numpy = y_tensor.numpy().squeeze(-1)
+            mask_y_numpy = mask_tensor.numpy().squeeze(-1)
+            
+            mae_stgcn = masked_mae_numpy(y_pred_stgcn, y_true_numpy, mask_y_numpy)
+            mae_ha = masked_mae_numpy(y_pred_ha, y_true_numpy, mask_y_numpy)
+            
+            stgcn_maes.append(mae_stgcn)
+            ha_maes.append(mae_ha)
+            
+            if i % 100 == 0 and i > 0:
+                print(f"Progresso: {i}/{len(dataset_teste)} janelas analisadas...")
+
+    # 6. Agregação Final
+    erro_final_stgcn = np.mean(stgcn_maes)
+    erro_final_ha = np.mean(ha_maes)
+    
+    ganho_percentual = ((erro_final_ha - erro_final_stgcn) / erro_final_ha) * 100
+    
+    print("\n" + "="*50)
+    print("🔬 RELATÓRIO DE DESEMPENHO CIENTÍFICO (TEST DATASET)")
+    print("="*50)
+    print(f"Métrica Avaliada: Masked MAE (Z-Score)")
+    print(f"Amostras: {len(dataset_teste)} janelas espaço-temporais.")
+    print("-" * 50)
+    print(f"Baseline (Média Histórica) : {erro_final_ha:.4f}")
+    print(f"Modelo Proposto (STGCN)    : {erro_final_stgcn:.4f}")
+    print("-" * 50)
+    if erro_final_stgcn < erro_final_ha:
+        print(f"✅ SUCESSO CIENTÍFICO: A IA reduziu o erro de previsão em {ganho_percentual:.2f}%.")
+        print("Conclusão: O acoplamento convolucional espaço-temporal aprendeu a física do trânsito e superou métodos estáticos.")
+    else:
+        print(f"❌ FRACASSO: O modelo burro venceu. A IA não aprendeu padrões generalizáveis (overfitting ou subtreinamento).")
+    print("="*50)
+
+if __name__ == "__main__":
+    extrair_comparativo_cientifico()

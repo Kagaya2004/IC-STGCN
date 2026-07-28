@@ -46,7 +46,7 @@ def treinar_modelo():
     # Lote reduzido para 16 visando proteger a limitação de 6GB de VRAM
     batch_size = 16 
     train_loader, val_loader, test_loader = preparar_loaders_chicago(
-        batch_size=batch_size, window_size=12, horizon=12
+        batch_size=batch_size, window_size=12, horizon=6
     )
 
     # 4. Inicialização do Modelo
@@ -55,15 +55,15 @@ def treinar_modelo():
     model = STGCN_TrafficModel(
         in_channels=1, 
         hidden_channels=64, # Reduza para 32 se houver estouro de VRAM
-        out_channels=12,    # Previsão dos próximos 12 passos (2 horas)
+        out_channels=6,    # Previsão dos próximos 6 passos (1 hora)
         num_nodes=num_nodes
     ).to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    optimizer = optim.Adam(model.parameters(), lr=3e-3, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
 
     # 5. Loop de Treinamento
-    epochs = 50
+    epochs = 150
     best_val_loss = float('inf')
     caminho_pesos = model_dir / "stgcn_pesos_chicago.pth"
 

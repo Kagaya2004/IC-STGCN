@@ -64,7 +64,7 @@ class STGCN_TrafficModel(nn.Module):
     Arquitetura STGCN V2.5 otimizada para a malha viária de Chicago (N=1047).
     Suporta passagem dinâmica da matriz de adjacência no forward pass.
     """
-    def __init__(self, in_channels=1, hidden_channels=64, out_channels=12, num_nodes=1047):
+    def __init__(self, in_channels=1, hidden_channels=64, out_channels=6, num_nodes=1047):
         super(STGCN_TrafficModel, self).__init__()
         
         # Camada de projeção inicial para expansão de canais de feature (1 canal -> 64 canais)
