@@ -35,9 +35,7 @@ def treinar_modelo():
     WINDOW_SIZE = 12
     batch_size = 32
     
-    loaders = preparar_loaders_chicago(batch_size=batch_size, window_size=WINDOW_SIZE, horizon=HORIZON)
-    train_loader = loaders['treinamento']
-    val_loader = loaders['validacao']
+    train_loader, val_loader, test_loader = preparar_loaders_chicago(batch_size=batch_size, window_size=WINDOW_SIZE, horizon=HORIZON)
     
     caminho_meta = data_dir / "node_metadata.csv"
     caminho_adj = data_dir / "adj_mx.npy"
