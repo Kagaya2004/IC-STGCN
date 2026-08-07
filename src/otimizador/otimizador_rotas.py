@@ -128,15 +128,24 @@ def resolver_open_tsp(matriz_custo):
     num_nodes = len(matriz_custo)
     if num_nodes < 2: return []
         
-    print("-> Google OR-Tools: Calculando Rota Global Ótima...")
+    print("-> Google OR-Tools: Calculando Rota Global Ótima (Partida Fixa)...")
+    
+    # Cria a matriz com um nó extra (dummy) no final
     matriz_com_dummy = np.zeros((num_nodes + 1, num_nodes + 1), dtype=int)
     matriz_com_dummy[:num_nodes, :num_nodes] = matriz_custo
     
+    # O custo para ir de qualquer nó real para o nó fictício (fim) é 0.
     for i in range(num_nodes):
         matriz_com_dummy[i, num_nodes] = 0
         matriz_com_dummy[num_nodes, i] = 0
         
-    manager = pywrapcp.RoutingIndexManager(num_nodes + 1, 1, num_nodes)
+    # --- A MUDANÇA ACONTECE AQUI ---
+    starts = [0]            # Força o veículo a começar no índice 0 (seu primeiro ponto)
+    ends = [num_nodes]      # Força o veículo a terminar no nó dummy (deixando o final livre)
+    
+    manager = pywrapcp.RoutingIndexManager(num_nodes + 1, 1, starts, ends)
+    # -------------------------------
+    
     routing = pywrapcp.RoutingModel(manager)
 
     def distance_callback(from_index, to_index):
@@ -157,6 +166,7 @@ def resolver_open_tsp(matriz_custo):
         rota_otimizada_indices = []
         while not routing.IsEnd(index):
             node_index = manager.IndexToNode(index)
+            # Ignora o nó dummy na hora de montar o resultado final
             if node_index != num_nodes: 
                 rota_otimizada_indices.append(node_index)
             index = solution.Value(routing.NextVar(index))
