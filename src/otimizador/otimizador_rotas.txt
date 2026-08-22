@@ -3,166 +3,190 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 import osmnx as ox
-import os
 from pathlib import Path
 from scipy.spatial import KDTree
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
-# Silencia logs e ativa cache em disco para evitar bloqueios da API do OSM
 ox.settings.log_console = False
 ox.settings.use_cache = True
 
+
 def obter_grafo_osmnx(data_dir):
-    """ Carrega a malha geométrica real do The Loop em Chicago. """
     filepath = Path(data_dir) / "chicago_map.graphml"
     
-    if filepath.exists():
-        print("-> Malha viária (OSMnx) carregada do cache.")
-        return ox.load_graphml(filepath)
-    else:
-        print("-> Baixando malha viária do Centro de Chicago (OSMnx). Isso pode levar 1 minuto...")
-        bbox_chicago = (-87.6400, 41.8600, -87.6100, 41.8900)
-        G = ox.graph_from_bbox(bbox=bbox_chicago, network_type='drive')
-        ox.save_graphml(G, filepath)
+    if not filepath.exists():
+        print("⚠️ Malha viária não encontrada no disco.")
+        print("-> Baixando malha oficial do OpenStreetMap (Restrição: Veículos Motorizados)...")
+        G = ox.graph_from_place(
+            "Chicago Loop, Chicago, Illinois, USA", 
+            network_type="drive", 
+            simplify=True
+        )
+        ox.save_graphml(G, filepath=filepath)
         return G
+    return ox.load_graphml(filepath)
 
-def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore):
-    """ 
-    Injeta as predições de forma estritamente orgânica e data-driven.
-    A barreira geográfica artificial foi permanentemente removida.
-    """
+
+def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore, min_mph=10.0):
     print("-> Sincronizando previsões da IA com ruas reais (KDTree)...")
     
-    coords_sensores = np.column_stack((meta_df['START_LATITUDE'], meta_df['START_LONGITUDE']))
-    arvore_kdtree = KDTree(coords_sensores)
+    mapa_abreviacoes = {"dr": "drive", "st": "street", "ave": "avenue", "blvd": "boulevard", "rd": "road", "pkwy": "parkway", "pl": "place"}
+    ruas_cta_normalizadas = []
     
-    # Desnormalização orgânica (Z-Score -> km/h)
-    pred_speeds_kmh = (pred_speeds_zscore * 12.0) + 30.0
-    pred_speeds_kmh = np.clip(pred_speeds_kmh, 5.0, 60.0)
-
-    for u, v, key, data in G_osm.edges(keys=True, data=True):
+    for rua_cta in meta_df['STREET'].dropna().unique():
+        tokens_cta = str(rua_cta).lower().replace("-", " ").split()
+        tokens_expandidos = {mapa_abreviacoes.get(t, t) for t in tokens_cta}
+        ruas_cta_normalizadas.append(tokens_expandidos)
+    
+    coords_ia = meta_df[['START_LATITUDE', 'START_LONGITUDE']].values
+    kdtree = KDTree(coords_ia)
+    
+    STD_VELOCIDADE = 10.0
+    MEAN_VELOCIDADE = 25.0
+    
+    # Aplica o limite dinâmico recebido do motor
+    pred_mph = np.maximum(min_mph, (pred_speeds_zscore * STD_VELOCIDADE) + MEAN_VELOCIDADE)
+    
+    for u, v, k, data in G_osm.edges(keys=True, data=True):
         if 'geometry' in data:
-            lat_rua = data['geometry'].centroid.y
-            lon_rua = data['geometry'].centroid.x
+            lat_edge = data['geometry'].centroid.y
+            lon_edge = data['geometry'].centroid.x
         else:
-            lat_rua = G_osm.nodes[u]['y']
-            lon_rua = G_osm.nodes[u]['x']
+            lat_edge = (G_osm.nodes[u]['y'] + G_osm.nodes[v]['y']) / 2.0
+            lon_edge = (G_osm.nodes[u]['x'] + G_osm.nodes[v]['x']) / 2.0
             
-        _, indice_sensor = arvore_kdtree.query([lat_rua, lon_rua])
-        velocidade_ia = pred_speeds_kmh[indice_sensor]
+        _, idx_ia = kdtree.query([lat_edge, lon_edge])
+        idx_ia = int(np.atleast_1d(idx_ia)[0]) 
         
-        length_km = data.get('length', 0) / 1000.0
-        tempo_segundos = (length_km / velocidade_ia) * 3600.0
+        try:
+            if idx_ia >= len(pred_mph):
+                idx_ia = len(pred_mph) - 1
+            vel_prevista_mph = pred_mph[idx_ia]
+        except IndexError:
+            vel_prevista_mph = MEAN_VELOCIDADE
+            
+        vel_prevista_kmh = vel_prevista_mph * 1.60934
         
-        data['weight'] = tempo_segundos
-        data['speed_kmh'] = velocidade_ia
-        data['distance_km'] = length_km
+        length_meters = data.get('length', 100.0)
+        if isinstance(length_meters, list):
+            length_meters = float(length_meters[0])
+        else:
+            length_meters = float(length_meters)
+            
+        length_km = length_meters / 1000.0
+        
+        tempo_segundos = (length_km / vel_prevista_kmh) * 3600.0
+        
+        # Calibração de Fricção Urbana (Multiplicador de Atrito)
+        tempo_segundos *= 2.20
+        
+        nome_osm = data.get('name', '')
+        if isinstance(nome_osm, list):
+            nome_osm = " ".join(nome_osm)
+            
+        tokens_osm = set(str(nome_osm).lower().replace("-", " ").split())
+        
+        via_conhecida_ia = False
+        for tokens_cta in ruas_cta_normalizadas:
+            if tokens_cta.issubset(tokens_osm):
+                via_conhecida_ia = True
+                break
+                
+        # Heurística Anti Zigue-Zague
+        if not via_conhecida_ia:
+            tempo_segundos *= 1.30  
+            
+        velocidade_efetiva_kmh = (length_km / tempo_segundos) * 3600.0 if tempo_segundos > 0 else vel_prevista_kmh
+            
+        data['travel_time_sec'] = float(tempo_segundos)
+        data['travel_time'] = float(tempo_segundos)
+        data['weight'] = float(tempo_segundos)
+        data['predicted_speed_kmh'] = float(velocidade_efetiva_kmh)
+        data['speed_kph'] = float(velocidade_efetiva_kmh) 
 
     return G_osm
 
-def gerar_matriz_custos_granular(model, data_path, meta_path, adj_tensor, device, coordenadas_reais_usuario, modo="Tempo Real"):
-    print(f"\n--- MOTOR HÍBRIDO DE ROTEAMENTO ({modo}) ---")
-    
-    meta_df = pd.read_csv(meta_path)
-    G_osm = obter_grafo_osmnx(data_path.parent)
-    
-    tensor_historico = np.load(data_path).astype(np.float32)
-    tensor_limpo = np.nan_to_num(tensor_historico, nan=0.0)
-    
-    if modo == "Pico Histórico (Stress Test)":
-        # 1. ABORDAGEM DATA-DRIVEN: Busca pelo Caos Orgânico (Maior Desvio Padrão)
-        # Em vez de pegar a menor velocidade absoluta, buscamos o instante em que 
-        # a diferença entre as ruas rápidas e as ruas travadas foi a maior possível na cidade.
-        std_por_passo = np.std(tensor_limpo, axis=(1, 2))
-        somas_janelas_std = np.convolve(std_por_passo, np.ones(12), 'valid')
-        indice_caos_real = np.argmax(somas_janelas_std)
-        
-        print(f"-> [Caos Orgânico Detetado] Extraída a janela histórica de tráfego com maior assimetria viária (Índice {indice_caos_real}).")
-        x_input = tensor_limpo[indice_caos_real : indice_caos_real + 12, :, :] 
-    else:
-        print("-> [Tempo Real] Carregando a janela de dados mais recente...")
-        x_input = tensor_limpo[-12:, :, :]
-    
-    x_tensor = torch.tensor(x_input).unsqueeze(0).to(device)
-
-    model.eval()
-    with torch.no_grad():
-        y_pred = model(x_tensor, adj_tensor) 
-        
-    previsao_agregada_zscore = y_pred.squeeze().mean(dim=0).cpu().numpy()
-
-    if modo == "Pico Histórico (Stress Test)":
-        # 2. ABORDAGEM ACADÊMICA: Temperature Scaling (Sharpening)
-        # Redes neurais suavizam os dados (Regression to the mean). 
-        # Para evidenciar para o Otimizador as escolhas sutis da IA, nós alongamos 
-        # a variância da predição mantendo a distribuição intacta.
-        media = np.mean(previsao_agregada_zscore)
-        previsao_agregada_zscore = media + (previsao_agregada_zscore - media) * 3.5
-        print("-> [Temperature Scaling] Aplicado afiamento estatístico para combater o 'Model Smoothing' da rede neural.")
-
-    # Constrói o grafo apenas com os dados e predições empíricas
-    G_hibrido = construir_grafo_hibrido(G_osm, meta_df, previsao_agregada_zscore)
-
-    num_pontos = len(coordenadas_reais_usuario)
-    matriz_custos = np.zeros((num_pontos, num_pontos), dtype=int)
-    
-    print(f"-> Calculando Dijkstra Otimizado para {num_pontos} endereços...")
-    
-    nos_entrega = []
-    for lat, lon in coordenadas_reais_usuario:
-        no_osm = ox.distance.nearest_nodes(G_hibrido, X=lon, Y=lat)
-        nos_entrega.append(no_osm)
-        
-    for i in range(num_pontos):
-        for j in range(num_pontos):
-            if i != j:
-                try:
-                    tempo_segundos = nx.shortest_path_length(G_hibrido, nos_entrega[i], nos_entrega[j], weight='weight')
-                    matriz_custos[i][j] = int(tempo_segundos)
-                except nx.NetworkXNoPath:
-                    matriz_custos[i][j] = 999999 
-                    
-    return matriz_custos, nos_entrega, G_hibrido
 
 def resolver_open_tsp(matriz_custo):
     num_nodes = len(matriz_custo)
-    if num_nodes < 2: return []
+    if num_nodes < 2: return list(range(num_nodes))
         
-    print("-> Google OR-Tools: Calculando Rota Global Ótima...")
-    matriz_com_dummy = np.zeros((num_nodes + 1, num_nodes + 1), dtype=int)
-    matriz_com_dummy[:num_nodes, :num_nodes] = matriz_custo
+    matriz_tsp = np.pad(matriz_custo, ((0, 1), (0, 1)), mode='constant', constant_values=0)
+    num_tsp_nodes = num_nodes + 1
     
-    for i in range(num_nodes):
-        matriz_com_dummy[i, num_nodes] = 0
-        matriz_com_dummy[num_nodes, i] = 0
-        
-    manager = pywrapcp.RoutingIndexManager(num_nodes + 1, 1, num_nodes)
+    manager = pywrapcp.RoutingIndexManager(num_tsp_nodes, 1, num_tsp_nodes - 1)
     routing = pywrapcp.RoutingModel(manager)
-
+    
     def distance_callback(from_index, to_index):
         from_node = manager.IndexToNode(from_index)
         to_node = manager.IndexToNode(to_index)
-        return int(matriz_com_dummy[from_node][to_node])
-
+        return int(matriz_tsp[from_node][to_node] * 1000)
+        
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
     
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-
-    solution = routing.SolveWithParameters(search_parameters)
     
-    if solution:
-        index = routing.Start(0)
-        rota_otimizada_indices = []
-        while not routing.IsEnd(index):
-            node_index = manager.IndexToNode(index)
-            if node_index != num_nodes: 
-                rota_otimizada_indices.append(node_index)
-            index = solution.Value(routing.NextVar(index))
-            
-        print(f"-> Rota encontrada! Sequência de paradas: {rota_otimizada_indices}")
-        return rota_otimizada_indices
-    else:
-        print("-> Falha: Nenhuma rota viável encontrada pelo solver.")
-        return []
+    solution = routing.SolveWithParameters(search_parameters)
+    if not solution: return list(range(num_nodes))
+        
+    index = routing.Start(0)
+    route = []
+    while not routing.IsEnd(index):
+        node = manager.IndexToNode(index)
+        if node < num_nodes: route.append(node)
+        index = solution.Value(routing.NextVar(index))
+    return route
+
+
+def gerar_matriz_custos_granular(model, data_path, meta_path, adj_tensor, device, coordenadas_reais_usuario, modo="Tempo Real"):
+    data_dir = Path(data_path).parent
+    G_osm = obter_grafo_osmnx(data_dir)
+    meta_df = pd.read_csv(meta_path)
+    
+    data_teste = np.load(data_path)
+    input_tensor = torch.tensor(data_teste[-1:], dtype=torch.float32).unsqueeze(-1).to(device)
+    
+    model.eval()
+    with torch.no_grad():
+        pred_zscore = model(input_tensor, adj_tensor).squeeze(0).cpu().numpy()
+        
+    # Prevenção de "NaN Poisoning"
+    pred_zscore = np.nan_to_num(pred_zscore, nan=0.0, posinf=0.0, neginf=0.0)
+        
+    pred_zscore_avg = np.mean(pred_zscore, axis=0)
+    
+    # LÓGICA DE ESTRESSE CIENTIFICAMENTE BLINDADA
+    limite_velocidade_mph = 10.0
+    if modo == "Pico Histórico (Stress Test)":
+        # Subtrai 1.0 desvio padrão (Hora do Rush Pesada) em vez de 2.0 (Paralisação Total)
+        # Isso preserva a variância para que o roteador não ignore a STGCN
+        pred_zscore_avg = pred_zscore_avg - 1.0
+        # Mantém 10.0 mph para evitar Saturação de Gradiente (Flatline na matriz de custos)
+        limite_velocidade_mph = 10.0
+        
+    if pred_zscore_avg.ndim > 1:
+        pred_zscore_avg = np.mean(pred_zscore_avg, axis=-1)
+        
+    G_hibrido = construir_grafo_hibrido(G_osm, meta_df, pred_zscore_avg, min_mph=limite_velocidade_mph)
+    
+    nos_usuario = []
+    for lat, lon in coordenadas_reais_usuario:
+        no_proximo = ox.distance.nearest_nodes(G_hibrido, X=lon, Y=lat)
+        nos_usuario.append(no_proximo)
+        
+    num_pontos = len(nos_usuario)
+    matriz_custos = np.zeros((num_pontos, num_pontos))
+    
+    for i in range(num_pontos):
+        for j in range(num_pontos):
+            if i == j: continue
+            origem, destino = nos_usuario[i], nos_usuario[j]
+            try:
+                length_sec = nx.shortest_path_length(G_hibrido, origem, destino, weight='travel_time_sec')
+                matriz_custos[i][j] = length_sec
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                matriz_custos[i][j] = 999999.0
+
+    return matriz_custos, nos_usuario, G_hibrido

@@ -74,7 +74,7 @@ def calcular_distancia_haversine(lat1, lon1, lat2, lon2):
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 def obter_caminho_detalhado_sem_cortes(G_osm, path_nodes):
-    """ Extrai a curva perfeita das ruas estritamente sobre o asfalto, sem cortes. """
+    """ Extrai a curva das ruas sobre o asfalto. """
     coords_rua = []
     for i in range(len(path_nodes) - 1):
         u = path_nodes[i]
@@ -161,10 +161,10 @@ with st.sidebar:
                     rota_indices = resolver_open_tsp(matriz_custo)
 
                     if rota_indices:
-                        tempo_total_segundos = 0
+                        tempo_total_segundos = 0.0
                         distancia_total_acumulada_km = 0.0
-                        CUSTO_URBANO_TRECHO_SEGUNDOS = 90
                         trechos_detalhes = []
+                        caminhos_completos_ia = []
 
                         for i in range(len(rota_indices) - 1):
                             idx_atual = rota_indices[i]
@@ -175,10 +175,17 @@ with st.sidebar:
                             p_orig_alfinete = st.session_state.pontos[idx_atual]
                             p_dest_alfinete = st.session_state.pontos[idx_prox]
 
-                            tempo_trecho_ia = nx.shortest_path_length(G_hibrido, orig, dest, weight='weight')
-                            tempo_trecho_calibrado = tempo_trecho_ia + CUSTO_URBANO_TRECHO_SEGUNDOS
-                            tempo_total_segundos += tempo_trecho_calibrado
-                            minutos_trecho = int(math.ceil(tempo_trecho_calibrado / 60.0))
+                            path_nodes = nx.shortest_path(G_hibrido, orig, dest, weight='travel_time_sec')
+                            caminhos_completos_ia.append(path_nodes)
+                            
+                            tempo_trecho_segundos = nx.shortest_path_length(G_hibrido, orig, dest, weight='travel_time_sec')
+                            
+                            # BLINDAGEM DE INTERFACE: Protege contra valores nulos não previstos antes da conversão int
+                            if math.isnan(tempo_trecho_segundos) or math.isinf(tempo_trecho_segundos):
+                                tempo_trecho_segundos = 999.0
+                                
+                            tempo_total_segundos += tempo_trecho_segundos
+                            minutos_trecho = max(1, int(round(tempo_trecho_segundos / 60.0)))
 
                             try:
                                 lat_no_orig, lon_no_orig = G_hibrido.nodes[orig]['y'], G_hibrido.nodes[orig]['x']
@@ -186,7 +193,11 @@ with st.sidebar:
 
                                 dist_acesso_origem = calcular_distancia_haversine(p_orig_alfinete['lat'], p_orig_alfinete['lon'], lat_no_orig, lon_no_orig)
                                 dist_acesso_destino = calcular_distancia_haversine(lat_no_dest, lon_no_dest, p_dest_alfinete['lat'], p_dest_alfinete['lon'])
-                                distancia_malha_metros = nx.shortest_path_length(G_hibrido, orig, dest, weight='length')
+                                
+                                distancia_malha_metros = sum(
+                                    G_hibrido.get_edge_data(path_nodes[n], path_nodes[n+1])[0].get('length', 0)
+                                    for n in range(len(path_nodes) - 1)
+                                )
 
                                 distancia_total_metros = distancia_malha_metros + dist_acesso_origem + dist_acesso_destino
                                 distancia_km = distancia_total_metros / 1000.0
@@ -203,16 +214,17 @@ with st.sidebar:
                             })
 
                         tempo_total_minutos = tempo_total_segundos / 60.0
-                        minutos_arredondados_global = int(math.ceil(tempo_total_minutos))
-                        tempo_texto_final = f"{minutos_arredondados_global} min" if minutos_arredondados_global < 60 else f"{minutos_arredondados_global // 60} h {minutos_arredondados_global % 60} min"
+                        minutos_totais_global = max(1, int(round(tempo_total_minutos)))
+                        tempo_texto_final = f"{minutos_totais_global} min" if minutos_totais_global < 60 else f"{minutos_totais_global // 60} h {minutos_totais_global % 60} min"
 
                         st.session_state.metricas = {
                             "sequencia_ideal": [st.session_state.pontos[i]['nome'] for i in rota_indices],
                             "rota_indices": rota_indices,
+                            "caminhos_ia": caminhos_completos_ia,
                             "tempo_exibicao": tempo_texto_final,
                             "trechos_tabela": trechos_detalhes,
                             "distancia_total_km": distancia_total_acumulada_km,
-                            "minutos_totais": minutos_arredondados_global
+                            "minutos_totais": minutos_totais_global
                         }
                         st.rerun()
                     else:
@@ -227,49 +239,40 @@ with coluna_esquerda_mapa:
     mapa_folium = folium.Map(location=[41.8781, -87.6298], zoom_start=14, tiles="cartodbpositron")
 
     if st.session_state.metricas and 'rota_indices' in st.session_state.metricas:
-        with st.spinner("Projetando geometria perfeita no asfalto..."):
+        with st.spinner("Projetando geometria no asfalto..."):
             try:
                 G_osm = ox.load_graphml(data_dir / "chicago_map.graphml")
-                coordenadas = [(p['lat'], p['lon']) for p in st.session_state.pontos]
-                # Ancoragem estrita baseada em NÓS (Esquinas) para evitar que o algoritmo corte os prédios
-                nos_entrega = ox.distance.nearest_nodes(G_osm, X=[p[1] for p in coordenadas], Y=[p[0] for p in coordenadas])
             except Exception:
                 st.error("Erro Crítico: Malha viária GraphML ausente.")
                 st.stop()
 
             indices_otimizados = st.session_state.metricas['rota_indices']
+            caminhos_ia = st.session_state.metricas.get('caminhos_ia', [])
             num_segmentos = len(indices_otimizados) - 1
 
             for i in range(num_segmentos):
                 orig_idx, dest_idx = indices_otimizados[i], indices_otimizados[i+1]
-                orig_osm, dest_osm = nos_entrega[orig_idx], nos_entrega[dest_idx]
                 p_orig_exato, p_dest_exato = st.session_state.pontos[orig_idx], st.session_state.pontos[dest_idx]
 
                 try:
-                    # 1. Dijkstra puramente sobre os nós reais da rua
-                    path_nodes = nx.shortest_path(G_osm, orig_osm, dest_osm, weight='length')
-                    
-                    # 2. Extração limpa (Sem Jitter, 100% no asfalto)
+                    path_nodes = caminhos_ia[i]
                     coords_rua = obter_caminho_detalhado_sem_cortes(G_osm, path_nodes)
 
-                    # 3. Espessura em Cascata: cria o efeito 'Neon' para rotas sobrepostas
                     espessura_linha = max(9 - (i * 2), 3)
                     cor_atual = PALETA_CORES_HEX[i % len(PALETA_CORES_HEX)]
 
-                    # Desenha o fluxo Veicular
                     AntPath(
                         locations=coords_rua, color=cor_atual, weight=espessura_linha,
                         opacity=0.9, dash_array=[12, 24], pulse_color="#ffffff", delay=550
                     ).add_to(mapa_folium)
 
-                    # 4. Access Links (Conexão pontilhada de pedestre da esquina até o alfinete exato do prédio)
                     folium.PolyLine([[p_orig_exato['lat'], p_orig_exato['lon']], coords_rua[0]],
                                     color="#6c757d", weight=2, dash_array="4, 6", opacity=0.8).add_to(mapa_folium)
                                     
                     folium.PolyLine([coords_rua[-1], [p_dest_exato['lat'], p_dest_exato['lon']]],
                                     color="#6c757d", weight=2, dash_array="4, 6", opacity=0.8).add_to(mapa_folium)
 
-                except nx.NetworkXNoPath:
+                except (IndexError, nx.NetworkXNoPath):
                     pass
 
             for ordem_visita, original_idx in enumerate(indices_otimizados):
