@@ -236,7 +236,17 @@ coluna_esquerda_mapa, coluna_direita_metricas = st.columns([2, 1])
 
 with coluna_esquerda_mapa:
     st.subheader("Visualização Espacial da Rota Otimizada")
-    mapa_folium = folium.Map(location=[41.8781, -87.6298], zoom_start=14, tiles="cartodbpositron")
+    
+    # 1. Cria o mapa base vazio (sem tiles)
+    mapa_folium = folium.Map(location=[41.8781, -87.6298], zoom_start=14, tiles=None)
+    
+    # 2. Adiciona a camada Stamen Toner com a atribuição (attribution) obrigatória exigida pelo Folium/Leaflet
+    folium.TileLayer(
+        tiles='https://tiles.stadiamaps.com/tiles/stamen_toner/{z}/{x}/{y}{r}.png',
+        attr='&copy; <a href="https://stadiamaps.com/">Stadia Maps</a> &copy; <a href="https://stamen.com/">Stamen Design</a> &copy; <a href="https://openmaptiles.org/">OpenMapTiles</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+        name='Stamen Toner',
+        max_zoom=20
+    ).add_to(mapa_folium)
 
     if st.session_state.metricas and 'rota_indices' in st.session_state.metricas:
         with st.spinner("Projetando geometria no asfalto..."):
