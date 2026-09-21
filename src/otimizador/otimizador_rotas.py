@@ -12,6 +12,10 @@ ox.settings.use_cache = True
 
 
 def obter_grafo_osmnx(data_dir):
+    """
+    Carrega o grafo viário de Chicago a partir de um arquivo GraphML local 
+    ou baixa a malha oficial do OpenStreetMap caso o arquivo não exista.
+    """
     filepath = Path(data_dir) / "chicago_map.graphml"
     
     if not filepath.exists():
@@ -28,6 +32,10 @@ def obter_grafo_osmnx(data_dir):
 
 
 def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore, min_mph=10.0):
+    """
+    Sincroniza as previsões de velocidade da rede STGCN com as arestas reais 
+    do grafo OSMnx utilizando KDTree, aplicando conversões métricas e penalidades de atrito urbano.
+    """
     print("-> Sincronizando previsões da IA com ruas reais (KDTree)...")
     
     mapa_abreviacoes = {"dr": "drive", "st": "street", "ave": "avenue", "blvd": "boulevard", "rd": "road", "pkwy": "parkway", "pl": "place"}
@@ -44,7 +52,7 @@ def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore, min_mph=10.0):
     STD_VELOCIDADE = 10.0
     MEAN_VELOCIDADE = 25.0
     
-    # Aplica o limite dinâmico recebido do motor
+    # Aplica o limite dinâmico de velocidade mínima (piso seguro para evitar saturação)
     pred_mph = np.maximum(min_mph, (pred_speeds_zscore * STD_VELOCIDADE) + MEAN_VELOCIDADE)
     
     for u, v, k, data in G_osm.edges(keys=True, data=True):
@@ -65,8 +73,10 @@ def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore, min_mph=10.0):
         except IndexError:
             vel_prevista_mph = MEAN_VELOCIDADE
             
+        # Conversão de unidades: MPH para KM/H
         vel_prevista_kmh = vel_prevista_mph * 1.60934
         
+        # Tratamento de segurança para comprimentos retornados como lista pelo OSMnx
         length_meters = data.get('length', 100.0)
         if isinstance(length_meters, list):
             length_meters = float(length_meters[0])
@@ -75,9 +85,10 @@ def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore, min_mph=10.0):
             
         length_km = length_meters / 1000.0
         
+        # Cálculo do tempo base físico em segundos
         tempo_segundos = (length_km / vel_prevista_kmh) * 3600.0
         
-        # Calibração de Fricção Urbana (Multiplicador de Atrito)
+        # Multiplicador de Fricção Urbana (simula paradas em semáforos e cruzamentos)
         tempo_segundos *= 2.20
         
         nome_osm = data.get('name', '')
@@ -92,12 +103,14 @@ def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore, min_mph=10.0):
                 via_conhecida_ia = True
                 break
                 
-        # Heurística Anti Zigue-Zague
+        # Heurística Anti Zigue-Zague para vias secundárias não monitoradas pela CTA
         if not via_conhecida_ia:
             tempo_segundos *= 1.30  
             
+        # Engenharia reversa para estimar a velocidade efetiva para a interface
         velocidade_efetiva_kmh = (length_km / tempo_segundos) * 3600.0 if tempo_segundos > 0 else vel_prevista_kmh
             
+        # Padronização de chaves e pesos nas arestas do grafo
         data['travel_time_sec'] = float(tempo_segundos)
         data['travel_time'] = float(tempo_segundos)
         data['weight'] = float(tempo_segundos)
@@ -108,13 +121,19 @@ def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore, min_mph=10.0):
 
 
 def resolver_open_tsp(matriz_custo):
+    """
+    Resolve o Problema do Caixeiro Viajante (TSP) com rota aberta, 
+    ancorando obrigatoriamente o ponto de partida no índice 0 e permitindo término flexível.
+    """
     num_nodes = len(matriz_custo)
     if num_nodes < 2: return list(range(num_nodes))
         
+    # Adiciona um nó fantasma (dummy) com custo zero para suportar término aberto
     matriz_tsp = np.pad(matriz_custo, ((0, 1), (0, 1)), mode='constant', constant_values=0)
     num_tsp_nodes = num_nodes + 1
     
-    manager = pywrapcp.RoutingIndexManager(num_tsp_nodes, 1, num_tsp_nodes - 1)
+    # Restrição: Início fixo no índice 0 (Base) e término livre no nó fantasma [num_nodes]
+    manager = pywrapcp.RoutingIndexManager(num_tsp_nodes, 1, [0], [num_nodes])
     routing = pywrapcp.RoutingModel(manager)
     
     def distance_callback(from_index, to_index):
@@ -141,6 +160,10 @@ def resolver_open_tsp(matriz_custo):
 
 
 def gerar_matriz_custos_granular(model, data_path, meta_path, adj_tensor, device, coordenadas_reais_usuario, modo="Tempo Real"):
+    """
+    Executa a inferência do modelo STGCN, constrói o grafo híbrido com os custos previstos 
+    e calcula a matriz de custos granulares entre as paradas do usuário via Dijkstra.
+    """
     data_dir = Path(data_path).parent
     G_osm = obter_grafo_osmnx(data_dir)
     meta_df = pd.read_csv(meta_path)
@@ -152,18 +175,16 @@ def gerar_matriz_custos_granular(model, data_path, meta_path, adj_tensor, device
     with torch.no_grad():
         pred_zscore = model(input_tensor, adj_tensor).squeeze(0).cpu().numpy()
         
-    # Prevenção de "NaN Poisoning"
+    # Blindagem robusta contra propagação de NaNs (NaN Poisoning)
     pred_zscore = np.nan_to_num(pred_zscore, nan=0.0, posinf=0.0, neginf=0.0)
         
     pred_zscore_avg = np.mean(pred_zscore, axis=0)
     
-    # LÓGICA DE ESTRESSE CIENTIFICAMENTE BLINDADA
+    # Configuração de cenários: Tempo Real vs. Stress Test (Pico Histórico)
     limite_velocidade_mph = 10.0
     if modo == "Pico Histórico (Stress Test)":
-        # Subtrai 1.0 desvio padrão (Hora do Rush Pesada) em vez de 2.0 (Paralisação Total)
-        # Isso preserva a variância para que o roteador não ignore a STGCN
+        # Deslocamento estatístico moderado para simular hora do rush severa
         pred_zscore_avg = pred_zscore_avg - 1.0
-        # Mantém 10.0 mph para evitar Saturação de Gradiente (Flatline na matriz de custos)
         limite_velocidade_mph = 10.0
         
     if pred_zscore_avg.ndim > 1:
@@ -185,8 +206,9 @@ def gerar_matriz_custos_granular(model, data_path, meta_path, adj_tensor, device
             origem, destino = nos_usuario[i], nos_usuario[j]
             try:
                 length_sec = nx.shortest_path_length(G_hibrido, origem, destino, weight='travel_time_sec')
-                matriz_custos[i][j] = length_sec
+                matriz_custo_val = length_sec
             except (nx.NetworkXNoPath, nx.NodeNotFound):
-                matriz_custos[i][j] = 999999.0
+                matriz_custo_val = 999999.0
+            matriz_custos[i][j] = matriz_custo_val
 
     return matriz_custos, nos_usuario, G_hibrido
