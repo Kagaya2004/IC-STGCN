@@ -31,10 +31,11 @@ def obter_grafo_osmnx(data_dir):
     return ox.load_graphml(filepath)
 
 
-def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore, min_mph=10.0):
+def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore, mean_speed, std_speed, min_mph=10.0):
     """
     Sincroniza as previsões de velocidade da rede STGCN com as arestas reais 
-    do grafo OSMnx utilizando KDTree, aplicando conversões métricas e penalidades de atrito urbano.
+    do grafo OSMnx utilizando KDTree, aplicando conversões métricas e penalidades de atrito urbano
+    com base nas estatísticas reais do scaler_stats.csv.
     """
     print("-> Sincronizando previsões da IA com ruas reais (KDTree)...")
     
@@ -49,11 +50,8 @@ def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore, min_mph=10.0):
     coords_ia = meta_df[['START_LATITUDE', 'START_LONGITUDE']].values
     kdtree = KDTree(coords_ia)
     
-    STD_VELOCIDADE = 10.0
-    MEAN_VELOCIDADE = 25.0
-    
-    # Aplica o limite dinâmico de velocidade mínima (piso seguro para evitar saturação)
-    pred_mph = np.maximum(min_mph, (pred_speeds_zscore * STD_VELOCIDADE) + MEAN_VELOCIDADE)
+    # Desnormalização parametrizada pelos dados REAIS de treinamento
+    pred_mph = np.maximum(min_mph, (pred_speeds_zscore * std_speed) + mean_speed)
     
     for u, v, k, data in G_osm.edges(keys=True, data=True):
         if 'geometry' in data:
@@ -71,7 +69,7 @@ def construir_grafo_hibrido(G_osm, meta_df, pred_speeds_zscore, min_mph=10.0):
                 idx_ia = len(pred_mph) - 1
             vel_prevista_mph = pred_mph[idx_ia]
         except IndexError:
-            vel_prevista_mph = MEAN_VELOCIDADE
+            vel_prevista_mph = mean_speed
             
         # Conversão de unidades: MPH para KM/H
         vel_prevista_kmh = vel_prevista_mph * 1.60934
@@ -161,12 +159,23 @@ def resolver_open_tsp(matriz_custo):
 
 def gerar_matriz_custos_granular(model, data_path, meta_path, adj_tensor, device, coordenadas_reais_usuario, modo="Tempo Real"):
     """
-    Executa a inferência do modelo STGCN, constrói o grafo híbrido com os custos previstos 
-    e calcula a matriz de custos granulares entre as paradas do usuário via Dijkstra.
+    Executa a inferência do modelo STGCN, carrega as estatísticas de desnormalização reais, 
+    constrói o grafo híbrido e calcula a matriz de custos granulares entre as paradas do usuário via Dijkstra.
     """
+    print(f"\n--- MOTOR HÍBRIDO DE ROTEAMENTO ({modo}) ---")
     data_dir = Path(data_path).parent
     G_osm = obter_grafo_osmnx(data_dir)
     meta_df = pd.read_csv(meta_path)
+    
+    # Extração dinâmica dos parâmetros físicos do scaler_stats.csv
+    caminho_stats = data_dir / "scaler_stats.csv"
+    if caminho_stats.exists():
+        stats = pd.read_csv(caminho_stats)
+        mean_speed = stats.loc[stats['feature'] == 'speed', 'mean'].values[0]
+        std_speed = stats.loc[stats['feature'] == 'speed', 'std'].values[0]
+    else:
+        print("⚠️ scaler_stats.csv não encontrado. Assumindo fallback (Média 21.65, Std 7.01).")
+        mean_speed, std_speed = 21.65, 7.01
     
     data_teste = np.load(data_path)
     input_tensor = torch.tensor(data_teste[-1:], dtype=torch.float32).unsqueeze(-1).to(device)
@@ -190,7 +199,12 @@ def gerar_matriz_custos_granular(model, data_path, meta_path, adj_tensor, device
     if pred_zscore_avg.ndim > 1:
         pred_zscore_avg = np.mean(pred_zscore_avg, axis=-1)
         
-    G_hibrido = construir_grafo_hibrido(G_osm, meta_df, pred_zscore_avg, min_mph=limite_velocidade_mph)
+    # Injeção segura das estatísticas reais obtidas do pipeline de dados
+    G_hibrido = construir_grafo_hibrido(
+        G_osm, meta_df, pred_zscore_avg, 
+        mean_speed=mean_speed, std_speed=std_speed, 
+        min_mph=limite_velocidade_mph
+    )
     
     nos_usuario = []
     for lat, lon in coordenadas_reais_usuario:
