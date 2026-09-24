@@ -8,19 +8,9 @@ base_dir = Path(__file__).resolve().parents[2]
 sys.path.append(str(base_dir))
 
 from src.modelo.modelo_STGCN import STGCN_TrafficModel
-from src.preprocessamento.dataLoader import ChicagoTrafficDataset
-
-def masked_mae_numpy(y_pred, y_true, mask):
-    mask = mask.astype(np.float32)
-    mask_sum = np.sum(mask)
-    if mask_sum == 0:
-        return 0.0
-    loss = np.abs(y_pred - y_true) * mask
-    return np.sum(loss) / mask_sum
 
 def extrair_comparativo_cientifico():
-    print("Iniciando Extração Avançada de Métricas (Múltiplos Baselines)...")
-    print("Modo de Auditoria: Segregação Dinâmica (Percentil 20% piores janelas de tráfego)\n")
+    print("Iniciando Extração de Métricas Científicas (Auditoria Multicritério)...")
     
     data_dir = base_dir / "data" / "tratados"
     modelo_dir = base_dir / "src" / "modelo"
@@ -30,95 +20,142 @@ def extrair_comparativo_cientifico():
     caminho_pesos = modelo_dir / "stgcn_pesos_chicago.pth"
     caminho_meta = data_dir / "node_metadata.csv"
     caminho_adj = data_dir / "adj_mx.npy"
+    caminho_stats = data_dir / "scaler_stats.csv"
     
+    # 1. Carregamento das Estatísticas para Desnormalização (MPH)
+    stats_df = pd.read_csv(caminho_stats)
+    std_speed = float(stats_df.loc[stats_df['feature'] == 'speed', 'std'].values[0])
+    mean_speed = float(stats_df.loc[stats_df['feature'] == 'speed', 'mean'].values[0])
+    print(f"-> Estatísticas carregadas: Média = {mean_speed:.2f} MPH | Desvio = {std_speed:.2f} MPH")
+
     HORIZON = 6
     WINDOW_SIZE = 12
     
-    dataset_teste = ChicagoTrafficDataset(caminho_dados_teste, caminho_mask_teste, window_size=WINDOW_SIZE, horizon=HORIZON)
+    # Carregamento em memória dos tensores brutos de teste
+    data_teste = np.load(caminho_dados_teste).astype(np.float32)
+    mask_teste = np.load(caminho_mask_teste).astype(np.float32)
+    adj_mx = np.load(caminho_adj).astype(np.float32)
     meta_df = pd.read_csv(caminho_meta)
     num_nodes = len(meta_df)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"-> Dispositivo de cálculo: {device.type.upper()}")
+    
     model = STGCN_TrafficModel(in_channels=1, hidden_channels=64, out_channels=HORIZON, num_nodes=num_nodes).to(device)
     model.load_state_dict(torch.load(caminho_pesos, map_location=device, weights_only=True))
     model.eval()
     
-    adj_mx = np.load(caminho_adj)
     adj_tensor = torch.tensor(adj_mx, dtype=torch.float32).to(device)
     
-    metricas_janelas = []
+    total_janelas = len(data_teste) - WINDOW_SIZE - HORIZON + 1
+    print(f"-> Avaliando {total_janelas} janelas temporais...")
     
-    print(f"Calculando inferências sobre {len(dataset_teste)} janelas espaço-temporais...")
+    registros = []
+    
+    # Processamento em lote para acelerar a GPU
+    BATCH_SIZE = 64
     
     with torch.no_grad():
-        for i in range(len(dataset_teste)):
-            x_tensor, y_tensor, mask_tensor = dataset_teste[i]
-            x_input = x_tensor.unsqueeze(0).to(device)
+        for b_start in range(0, total_janelas, BATCH_SIZE):
+            b_end = min(b_start + BATCH_SIZE, total_janelas)
+            b_size = b_end - b_start
             
-            # --- MODELO 1: STGCN (Inteligência Artificial) ---
-            y_pred_stgcn = model(x_input, adj_tensor).squeeze(0).cpu().numpy()
+            x_batch_list, y_batch_list, mask_y_list, mask_x_list = [], [], [], []
             
-            # --- MODELO 2: Média Móvel Recente (Inércia Local) ---
-            x_numpy = x_tensor.numpy().squeeze(-1) 
-            mask_x = (~np.isclose(x_numpy, 0.0)).astype(np.float32)
-            elementos_validos = x_numpy[mask_x.astype(bool)]
-            velocidade_media_janela = np.mean(elementos_validos) if len(elementos_validos) > 0 else 0.0
+            for idx in range(b_start, b_end):
+                x = data_teste[idx : idx + WINDOW_SIZE]
+                y = data_teste[idx + WINDOW_SIZE : idx + WINDOW_SIZE + HORIZON]
+                m_x = mask_teste[idx : idx + WINDOW_SIZE]
+                m_y = mask_teste[idx + WINDOW_SIZE : idx + WINDOW_SIZE + HORIZON]
+                
+                x_batch_list.append(x)
+                y_batch_list.append(y)
+                mask_x_list.append(m_x)
+                mask_y_list.append(m_y)
+                
+            x_b = torch.tensor(np.array(x_batch_list), dtype=torch.float32).to(device)
+            y_b = np.array(y_batch_list).squeeze(-1)       # (B, H, N)
+            m_y_b = np.array(mask_y_list).squeeze(-1)      # (B, H, N)
+            x_b_np = np.array(x_batch_list).squeeze(-1)    # (B, W, N)
+            m_x_b = np.array(mask_x_list).squeeze(-1)      # (B, W, N)
             
-            soma_historica = np.sum(x_numpy, axis=0)
-            contagem_validos = np.sum(mask_x, axis=0)
-            media_historica_por_via = np.divide(soma_historica, contagem_validos, out=np.zeros_like(soma_historica), where=contagem_validos!=0)
-            y_pred_ma = np.tile(media_historica_por_via, (HORIZON, 1)) 
+            # --- MODELO 1: STGCN ---
+            y_pred_stgcn = model(x_b, adj_tensor).cpu().numpy() # (B, H, N)
             
-            # --- MODELO 3: Média Histórica Global (Baseline Real) ---
-            # Como os dados estão em Z-score, a média histórica global de todas as vias é exatamente 0.0
-            y_pred_global = np.zeros_like(y_pred_ma)
+            # --- MODELO 2: Média Móvel (Usando máscara real m_x_b) ---
+            soma_x = np.sum(x_b_np * m_x_b, axis=1) # (B, N)
+            qtd_x = np.sum(m_x_b, axis=1)           # (B, N)
+            media_via = np.divide(soma_x, qtd_x, out=np.zeros_like(soma_x), where=qtd_x != 0)
+            y_pred_ma = np.repeat(media_via[:, np.newaxis, :], HORIZON, axis=1) # (B, H, N)
             
-            y_true_numpy = y_tensor.numpy().squeeze(-1)
-            mask_y_numpy = mask_tensor.numpy().squeeze(-1)
+            # --- MODELO 3: Média Histórica Global (HA) ---
+            y_pred_ha = np.zeros_like(y_pred_ma)
             
-            mae_stgcn = masked_mae_numpy(y_pred_stgcn, y_true_numpy, mask_y_numpy)
-            mae_ma = masked_mae_numpy(y_pred_ma, y_true_numpy, mask_y_numpy)
-            mae_global = masked_mae_numpy(y_pred_global, y_true_numpy, mask_y_numpy)
-            
-            metricas_janelas.append({
-                "mae_stgcn": mae_stgcn,
-                "mae_ma": mae_ma,
-                "mae_global": mae_global,
-                "vel_media": velocidade_media_janela
-            })
-            
-            if i % 1000 == 0 and i > 0:
-                print(f"Progresso: {i}/{len(dataset_teste)} janelas...")
-
-    df_metricas = pd.DataFrame(metricas_janelas)
-    limiar_pico = np.percentile(df_metricas["vel_media"], 20)
+            # Cálculo de perdas mascaradas por janela
+            for i in range(b_size):
+                m_i = m_y_b[i]
+                soma_mask = np.sum(m_i)
+                if soma_mask == 0:
+                    continue
+                
+                loss_stgcn = np.sum(np.abs(y_pred_stgcn[i] - y_b[i]) * m_i) / soma_mask
+                loss_ma = np.sum(np.abs(y_pred_ma[i] - y_b[i]) * m_i) / soma_mask
+                loss_ha = np.sum(np.abs(y_pred_ha[i] - y_b[i]) * m_i) / soma_mask
+                
+                # Erro no horizonte de 60 min (passo 5 = índice final)
+                m_i_60 = m_i[-1]
+                soma_mask_60 = np.sum(m_i_60)
+                loss_stgcn_60 = np.sum(np.abs(y_pred_stgcn[i, -1] - y_b[i, -1]) * m_i_60) / soma_mask_60 if soma_mask_60 > 0 else loss_stgcn
+                loss_ma_60 = np.sum(np.abs(y_pred_ma[i, -1] - y_b[i, -1]) * m_i_60) / soma_mask_60 if soma_mask_60 > 0 else loss_ma
+                
+                # Velocidade média real observada na janela para classificar tráfego
+                leituras_validas = x_b_np[i][m_x_b[i] == 1]
+                vel_media_janela = np.mean(leituras_validas) if len(leituras_validas) > 0 else 0.0
+                
+                registros.append({
+                    "mae_stgcn": loss_stgcn,
+                    "mae_ma": loss_ma,
+                    "mae_ha": loss_ha,
+                    "mae_stgcn_60min": loss_stgcn_60,
+                    "mae_ma_60min": loss_ma_60,
+                    "vel_media": vel_media_janela
+                })
+                
+    df = pd.DataFrame(registros)
+    limiar_pico = np.percentile(df["vel_media"], 20)
     
-    df_pico = df_metricas[df_metricas["vel_media"] <= limiar_pico]
-    df_livre = df_metricas[df_metricas["vel_media"] > limiar_pico]
+    df_pico = df[df["vel_media"] <= limiar_pico]
+    df_livre = df[df["vel_media"] > limiar_pico]
+    
+    def formatar_linha(nome, subset):
+        ha_z = subset["mae_ha"].mean()
+        ma_z = subset["mae_ma"].mean()
+        st_z = subset["mae_stgcn"].mean()
+        
+        # Conversão direta para Milhas por Hora (MPH)
+        ha_mph = ha_z * std_speed
+        ma_mph = ma_z * std_speed
+        st_mph = st_z * std_speed
+        return f"{nome:<20} | {ha_mph:<16.2f} MPH | {ma_mph:<16.2f} MPH | {st_mph:<16.2f} MPH"
 
-    def calcular_sumario(df):
-        if len(df) == 0: return 0.0, 0.0, 0.0, 0
-        return df["mae_global"].mean(), df["mae_ma"].mean(), df["mae_stgcn"].mean(), len(df)
-
-    gb_g, ma_g, st_g, n_g = calcular_sumario(df_metricas)
-    gb_p, ma_p, st_p, n_p = calcular_sumario(df_pico)
-    gb_l, ma_l, st_l, n_l = calcular_sumario(df_livre)
-
-    print("\n" + "="*85)
-    print("🔬 RELATÓRIO DE DESEMPENHO CIENTÍFICO (COMPARAÇÃO TRÍPLICE)")
-    print("="*85)
+    print("\n" + "="*90)
+    print("🔬 RELATÓRIO CIENTÍFICO DE DESEMPENHO (ERRO ABSOLUTO MÉDIO EM MPH)")
+    print("="*90)
     print(f"{'CENÁRIO':<20} | {'MÉDIA GLOBAL (HA)':<20} | {'MÉDIA MÓVEL (MA)':<20} | {'STGCN (IA)'}")
-    print("-" * 85)
-    print(f"{'Trânsito Livre':<20} | {gb_l:<20.4f} | {ma_l:<20.4f} | {st_l:<20.4f}")
-    print(f"{'Pico/Congestionado':<20} | {gb_p:<20.4f} | {ma_p:<20.4f} | {st_p:<20.4f}")
-    print("-" * 85)
-    print(f"{'MÉDIA GLOBAL':<20} | {gb_g:<20.4f} | {ma_g:<20.4f} | {st_g:<20.4f}")
-    print("="*85)
+    print("-" * 90)
+    print(formatar_linha("Trânsito Livre", df_livre))
+    print(formatar_linha("Pico/Congestionado", df_pico))
+    print("-" * 90)
+    print(formatar_linha("MÉDIA GERAL", df))
+    print("="*90)
     
-    print("\n✅ CONCLUSÃO PARA O ARTIGO:")
-    print("A IA oblitera a Média Histórica Global (True HA), provando seu intenso aprendizado.")
-    print("A Média Móvel (MA) vence em MAE absoluto por força estatística de inércia, mas")
-    print("apenas a STGCN permite a extração topológica via grafos para o Otimizador de Rotas.")
+    # Auditoria de Longo Prazo (Horizonte de 60 min)
+    ma_60_mph = df["mae_ma_60min"].mean() * std_speed
+    st_60_mph = df["mae_stgcn_60min"].mean() * std_speed
+    print(f"\n📌 ANÁLISE DO HORIZONTE DE 60 MINUTOS:")
+    print(f" -> MAE Média Móvel (60 min): {ma_60_mph:.2f} MPH")
+    print(f" -> MAE STGCN (60 min):       {st_60_mph:.2f} MPH")
+    print(f" -> Vantagem do STGCN:        {ma_60_mph - st_60_mph:+.2f} MPH")
 
 if __name__ == "__main__":
     extrair_comparativo_cientifico()
