@@ -93,7 +93,11 @@ def processar_tensores_modulares():
         
         np.save(data_dir / f"data_{split}.npy", tensor_dados_norm)
         np.save(data_dir / f"mask_{split}.npy", tensor_mascara)
-        print(f"[{split.upper()}] Tensores salvos com sucesso.\n")
+        
+        # INJEÇÃO ESTRATÉGICA: Salvando o eixo temporal para auditoria e Histórico Global (HA)
+        np.save(data_dir / f"time_{split}.npy", tempos_continuos.to_numpy())
+        
+        print(f"[{split.upper()}] Tensores salvos com sucesso (Dados, Máscara e Tempo).\n")
 
 if __name__ == "__main__":
     processar_tensores_modulares()

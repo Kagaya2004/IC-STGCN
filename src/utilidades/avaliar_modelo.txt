@@ -6,21 +6,22 @@ from pathlib import Path
 from src.modelo.modelo_STGCN import STGCN_TrafficModel
 
 def avaliar_modelos_unificado():
-    print("Iniciando Avaliação Científica Unificada (STGCN vs Média Móvel vs Média Global)...")
+    print("Iniciando Avaliação Científica Unificada (STGCN vs Média Móvel vs Time-of-Day HA)...")
     
-    # 1. Configuração de Caminhos via Pathlib
     base_dir = Path(__file__).resolve().parents[2]
     data_dir = base_dir / "data" / "tratados"
     modelo_dir = base_dir / "src" / "modelo"
     
     caminho_dados_teste = data_dir / "data_teste.npy"
     caminho_mask_teste = data_dir / "mask_teste.npy"
+    caminho_tempo_teste = data_dir / "time_teste.npy"
+    caminho_perfil_ha = data_dir / "ha_profile.npy"
     caminho_pesos = modelo_dir / "stgcn_pesos_chicago.pth"
     caminho_meta = data_dir / "node_metadata.csv"
     caminho_adj = data_dir / "adj_mx.npy"
     caminho_stats = data_dir / "scaler_stats.csv"
     
-    # 2. Carregamento das Estatísticas para Desnormalização (MPH)
+    # 1. Carregamento das Estatísticas para Desnormalização (MPH)
     stats_df = pd.read_csv(caminho_stats)
     std_speed = float(stats_df.loc[stats_df['feature'] == 'speed', 'std'].values[0])
     mean_speed = float(stats_df.loc[stats_df['feature'] == 'speed', 'mean'].values[0])
@@ -29,12 +30,19 @@ def avaliar_modelos_unificado():
     HORIZON = 6
     WINDOW_SIZE = 12
     
-    # 3. Carregamento dos Tensores em Memória
+    # 2. Carregamento dos Tensores em Memória
     data_teste = np.load(caminho_dados_teste).astype(np.float32)
     mask_teste = np.load(caminho_mask_teste).astype(np.float32)
+    tempos_teste = np.load(caminho_tempo_teste, allow_pickle=True)
     adj_mx = np.load(caminho_adj).astype(np.float32)
+    ha_profile = np.load(caminho_perfil_ha).astype(np.float32)
+    
     meta_df = pd.read_csv(caminho_meta)
     num_nodes = len(meta_df)
+    
+    # Mapeamento do tempo de teste para índices diários (0 a 143)
+    df_tempos_teste = pd.to_datetime(tempos_teste)
+    idx_tempos_teste = (df_tempos_teste.hour * 6) + (df_tempos_teste.minute // 10)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"-> Dispositivo de cálculo: {device.type.upper()}")
@@ -58,6 +66,7 @@ def avaliar_modelos_unificado():
             b_size = b_end - b_start
             
             x_batch_list, y_batch_list, mask_y_list, mask_x_list = [], [], [], []
+            y_pred_ha_list = []
             
             for idx in range(b_start, b_end):
                 x = data_teste[idx : idx + WINDOW_SIZE]
@@ -65,19 +74,25 @@ def avaliar_modelos_unificado():
                 m_x = mask_teste[idx : idx + WINDOW_SIZE]
                 m_y = mask_teste[idx + WINDOW_SIZE : idx + WINDOW_SIZE + HORIZON]
                 
+                # Identifica os 6 índices de tempo no futuro para pescar o HA correto
+                h_idx = idx_tempos_teste[idx + WINDOW_SIZE : idx + WINDOW_SIZE + HORIZON]
+                ha_previsao = ha_profile[h_idx]
+                
                 x_batch_list.append(x)
                 y_batch_list.append(y)
                 mask_x_list.append(m_x)
                 mask_y_list.append(m_y)
+                y_pred_ha_list.append(ha_previsao)
                 
             x_b = torch.tensor(np.array(x_batch_list), dtype=torch.float32).to(device)
-            y_b = np.array(y_batch_list).squeeze(-1)       # (B, H, N)
-            m_y_b = np.array(mask_y_list).squeeze(-1)      # (B, H, N)
-            x_b_np = np.array(x_batch_list).squeeze(-1)    # (B, W, N)
-            m_x_b = np.array(mask_x_list).squeeze(-1)      # (B, W, N)
+            y_b = np.array(y_batch_list).squeeze(-1)       
+            m_y_b = np.array(mask_y_list).squeeze(-1)      
+            x_b_np = np.array(x_batch_list).squeeze(-1)    
+            m_x_b = np.array(mask_x_list).squeeze(-1)      
+            y_pred_ha = np.array(y_pred_ha_list)           # (B, H, N)
             
             # Inferência STGCN
-            y_pred_stgcn = model(x_b, adj_tensor).cpu().numpy() # (B, H, N)
+            y_pred_stgcn = model(x_b, adj_tensor).cpu().numpy()
             
             # Baseline Média Móvel (MA)
             soma_x = np.sum(x_b_np * m_x_b, axis=1)
@@ -85,10 +100,6 @@ def avaliar_modelos_unificado():
             media_via = np.divide(soma_x, qtd_x, out=np.zeros_like(soma_x), where=qtd_x != 0)
             y_pred_ma = np.repeat(media_via[:, np.newaxis, :], HORIZON, axis=1)
             
-            # Baseline Histórico Global (HA)
-            y_pred_ha = np.zeros_like(y_pred_ma)
-            
-            # Cálculo de perdas mascaradas por janela no lote
             for i in range(b_size):
                 m_i = m_y_b[i]
                 soma_mask = np.sum(m_i)
@@ -99,13 +110,11 @@ def avaliar_modelos_unificado():
                 loss_ma = np.sum(np.abs(y_pred_ma[i] - y_b[i]) * m_i) / soma_mask
                 loss_ha = np.sum(np.abs(y_pred_ha[i] - y_b[i]) * m_i) / soma_mask
                 
-                # Erro no horizonte de 60 min (último passo da predição)
                 m_i_60 = m_i[-1]
                 soma_mask_60 = np.sum(m_i_60)
                 loss_stgcn_60 = np.sum(np.abs(y_pred_stgcn[i, -1] - y_b[i, -1]) * m_i_60) / soma_mask_60 if soma_mask_60 > 0 else loss_stgcn
                 loss_ma_60 = np.sum(np.abs(y_pred_ma[i, -1] - y_b[i, -1]) * m_i_60) / soma_mask_60 if soma_mask_60 > 0 else loss_ma
                 
-                # Velocidade média real observada na janela para categorizar tráfego
                 leituras_validas = x_b_np[i][m_x_b[i] == 1]
                 vel_media_janela = np.mean(leituras_validas) if len(leituras_validas) > 0 else 0.0
                 
@@ -123,7 +132,6 @@ def avaliar_modelos_unificado():
 
     df_metricas = pd.DataFrame(registros)
     
-    # 4. Segregação por Percentil de Trânsito (20% mais lentos = Pico/Congestionado)
     limiar_pico = np.percentile(df_metricas["vel_media"], 20)
     df_pico = df_metricas[df_metricas["vel_media"] <= limiar_pico]
     df_livre = df_metricas[df_metricas["vel_media"] > limiar_pico]
@@ -142,7 +150,7 @@ def avaliar_modelos_unificado():
     print("\n" + "="*92)
     print("🔬 RELATÓRIO CIENTÍFICO DE DESEMPENHO (MÉTRICAS EM KM/H)")
     print("="*92)
-    print(f"{'CENÁRIO':<20} | {'GLOBAL BASELINE (HA)':<20} | {'MÉDIA MÓVEL (MA)':<20} | {'STGCN (IA)'}")
+    print(f"{'CENÁRIO':<20} | {'TIME-OF-DAY HA':<20} | {'MÉDIA MÓVEL (MA)':<20} | {'STGCN (IA)'}")
     print("-" * 92)
     print(f"{'Trânsito Livre':<20} | {gb_l:<16.2f} km/h | {ma_l:<16.2f} km/h | {st_l:<16.2f} km/h")
     print(f"{'Pico/Congestionado':<20} | {gb_p:<16.2f} km/h | {ma_p:<16.2f} km/h | {st_p:<16.2f} km/h")
@@ -150,7 +158,6 @@ def avaliar_modelos_unificado():
     print(f"{'MÉDIA GERAL':<20} | {gb_g:<16.2f} km/h | {ma_g:<16.2f} km/h | {st_g:<16.2f} km/h")
     print("="*92)
     
-    # Auditoria de Longo Prazo (60 minutos)
     ma_60_kmh = df_metricas["mae_ma_60min"].mean() * std_speed * FATOR_KMH
     st_60_kmh = df_metricas["mae_stgcn_60min"].mean() * std_speed * FATOR_KMH
     print(f"\n📌 ANÁLISE DO HORIZONTE DE 60 MINUTOS:")
@@ -158,7 +165,6 @@ def avaliar_modelos_unificado():
     print(f" -> MAE STGCN (60 min):       {st_60_kmh:.2f} km/h")
     print(f" -> Vantagem do STGCN:        {ma_60_kmh - st_60_kmh:+.2f} km/h")
 
-    # 5. Exportação dos Resultados para a pasta de logs
     log_dir = base_dir / "data" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     save_path = log_dir / "metricas_finais_kmh.csv"
