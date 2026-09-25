@@ -2,140 +2,167 @@ import torch
 import numpy as np
 import pandas as pd
 from pathlib import Path
-import os
 
 from src.modelo.modelo_STGCN import STGCN_TrafficModel
-from src.preprocessamento.dataLoader import ChicagoTrafficDataset
 
-def masked_mae_numpy(y_pred, y_true, mask):
-    """Calcula o Erro Absoluto Médio (MAE) ignorando os dados ausentes via máscara."""
-    mask = mask.astype(np.float32)
-    mask_sum = np.sum(mask)
-    if mask_sum == 0:
-        return 0.0
-    loss = np.abs(y_pred - y_true) * mask
-    return np.sum(loss) / mask_sum
-
-def avaliar_modelos():
-    print("Iniciando Avaliação Unificada de Modelos (STGCN vs Baselines)...")
-
+def avaliar_modelos_unificado():
+    print("Iniciando Avaliação Científica Unificada (STGCN vs Média Móvel vs Média Global)...")
+    
     # 1. Configuração de Caminhos via Pathlib
     base_dir = Path(__file__).resolve().parents[2]
     data_dir = base_dir / "data" / "tratados"
     modelo_dir = base_dir / "src" / "modelo"
-
+    
     caminho_dados_teste = data_dir / "data_teste.npy"
     caminho_mask_teste = data_dir / "mask_teste.npy"
     caminho_pesos = modelo_dir / "stgcn_pesos_chicago.pth"
     caminho_meta = data_dir / "node_metadata.csv"
     caminho_adj = data_dir / "adj_mx.npy"
-
-    # 2. Carregar Estatísticas para Desnormalização
-    stats = pd.read_csv(data_dir / "scaler_stats.csv")
-    mean_speed = stats.loc[stats['feature'] == 'speed', 'mean'].values[0]
-    std_speed = stats.loc[stats['feature'] == 'speed', 'std'].values[0]
-    print(f"-> Parâmetros Originais de Desnormalização: Média={mean_speed:.2f} MPH, Desvio={std_speed:.2f} MPH")
+    caminho_stats = data_dir / "scaler_stats.csv"
+    
+    # 2. Carregamento das Estatísticas para Desnormalização (MPH)
+    stats_df = pd.read_csv(caminho_stats)
+    std_speed = float(stats_df.loc[stats_df['feature'] == 'speed', 'std'].values[0])
+    mean_speed = float(stats_df.loc[stats_df['feature'] == 'speed', 'mean'].values[0])
+    print(f"-> Estatísticas carregadas: Média = {mean_speed:.2f} | Desvio = {std_speed:.2f} (Base original em MPH)")
 
     HORIZON = 6
     WINDOW_SIZE = 12
-
-    dataset_teste = ChicagoTrafficDataset(caminho_dados_teste, caminho_mask_teste, window_size=WINDOW_SIZE, horizon=HORIZON)
+    
+    # 3. Carregamento dos Tensores em Memória
+    data_teste = np.load(caminho_dados_teste).astype(np.float32)
+    mask_teste = np.load(caminho_mask_teste).astype(np.float32)
+    adj_mx = np.load(caminho_adj).astype(np.float32)
     meta_df = pd.read_csv(caminho_meta)
     num_nodes = len(meta_df)
-
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"-> Dispositivo de cálculo: {device.type.upper()}")
+    
     model = STGCN_TrafficModel(in_channels=1, hidden_channels=64, out_channels=HORIZON, num_nodes=num_nodes).to(device)
     model.load_state_dict(torch.load(caminho_pesos, map_location=device, weights_only=True))
     model.eval()
-
-    adj_mx = np.load(caminho_adj)
+    
     adj_tensor = torch.tensor(adj_mx, dtype=torch.float32).to(device)
-
-    metricas_janelas = []
-
-    print(f"Calculando inferências e aplicando conversão para KM/H em {len(dataset_teste)} janelas...")
-
+    
+    total_janelas = len(data_teste) - WINDOW_SIZE - HORIZON + 1
+    print(f"-> Avaliando {total_janelas} janelas temporais em lotes (Batch Processing)...")
+    
+    registros = []
+    BATCH_SIZE = 64
+    FATOR_KMH = 1.60934
+    
     with torch.no_grad():
-        for i in range(len(dataset_teste)):
-            x_tensor, y_tensor, mask_tensor = dataset_teste[i]
-            x_input = x_tensor.unsqueeze(0).to(device)
+        for b_start in range(0, total_janelas, BATCH_SIZE):
+            b_end = min(b_start + BATCH_SIZE, total_janelas)
+            b_size = b_end - b_start
             
-            # --- MODELO 1: STGCN (IA) ---
-            y_pred_stgcn_norm = model(x_input, adj_tensor).squeeze(0).cpu().numpy()
+            x_batch_list, y_batch_list, mask_y_list, mask_x_list = [], [], [], []
             
-            # --- MODELO 2: Média Móvel (MA) ---
-            x_numpy = x_tensor.numpy().squeeze(-1) 
-            mask_x = (~np.isclose(x_numpy, 0.0)).astype(np.float32)
-            elementos_validos = x_numpy[mask_x.astype(bool)]
+            for idx in range(b_start, b_end):
+                x = data_teste[idx : idx + WINDOW_SIZE]
+                y = data_teste[idx + WINDOW_SIZE : idx + WINDOW_SIZE + HORIZON]
+                m_x = mask_teste[idx : idx + WINDOW_SIZE]
+                m_y = mask_teste[idx + WINDOW_SIZE : idx + WINDOW_SIZE + HORIZON]
+                
+                x_batch_list.append(x)
+                y_batch_list.append(y)
+                mask_x_list.append(m_x)
+                mask_y_list.append(m_y)
+                
+            x_b = torch.tensor(np.array(x_batch_list), dtype=torch.float32).to(device)
+            y_b = np.array(y_batch_list).squeeze(-1)       # (B, H, N)
+            m_y_b = np.array(mask_y_list).squeeze(-1)      # (B, H, N)
+            x_b_np = np.array(x_batch_list).squeeze(-1)    # (B, W, N)
+            m_x_b = np.array(mask_x_list).squeeze(-1)      # (B, W, N)
             
-            soma_historica = np.sum(x_numpy, axis=0)
-            contagem_validos = np.sum(mask_x, axis=0)
-            media_historica_por_via = np.divide(soma_historica, contagem_validos, out=np.zeros_like(soma_historica), where=contagem_validos!=0)
-            y_pred_ma_norm = np.tile(media_historica_por_via, (HORIZON, 1)) 
+            # Inferência STGCN
+            y_pred_stgcn = model(x_b, adj_tensor).cpu().numpy() # (B, H, N)
             
-            # --- MODELO 3: Média Histórica Global (HA) ---
-            y_pred_global_norm = np.zeros_like(y_pred_ma_norm)
+            # Baseline Média Móvel (MA)
+            soma_x = np.sum(x_b_np * m_x_b, axis=1)
+            qtd_x = np.sum(m_x_b, axis=1)
+            media_via = np.divide(soma_x, qtd_x, out=np.zeros_like(soma_x), where=qtd_x != 0)
+            y_pred_ma = np.repeat(media_via[:, np.newaxis, :], HORIZON, axis=1)
             
-            # Alvos e Máscaras
-            y_true_norm = y_tensor.numpy().squeeze(-1)
-            mask_y_numpy = mask_tensor.numpy().squeeze(-1)
+            # Baseline Histórico Global (HA)
+            y_pred_ha = np.zeros_like(y_pred_ma)
             
-            # --- DESNORMALIZAÇÃO PARA UNIDADES REAIS E CONVERSÃO PARA KM/H ---
-            FATOR_KMH = 1.60934
+            # Cálculo de perdas mascaradas por janela no lote
+            for i in range(b_size):
+                m_i = m_y_b[i]
+                soma_mask = np.sum(m_i)
+                if soma_mask == 0:
+                    continue
+                
+                loss_stgcn = np.sum(np.abs(y_pred_stgcn[i] - y_b[i]) * m_i) / soma_mask
+                loss_ma = np.sum(np.abs(y_pred_ma[i] - y_b[i]) * m_i) / soma_mask
+                loss_ha = np.sum(np.abs(y_pred_ha[i] - y_b[i]) * m_i) / soma_mask
+                
+                # Erro no horizonte de 60 min (último passo da predição)
+                m_i_60 = m_i[-1]
+                soma_mask_60 = np.sum(m_i_60)
+                loss_stgcn_60 = np.sum(np.abs(y_pred_stgcn[i, -1] - y_b[i, -1]) * m_i_60) / soma_mask_60 if soma_mask_60 > 0 else loss_stgcn
+                loss_ma_60 = np.sum(np.abs(y_pred_ma[i, -1] - y_b[i, -1]) * m_i_60) / soma_mask_60 if soma_mask_60 > 0 else loss_ma
+                
+                # Velocidade média real observada na janela para categorizar tráfego
+                leituras_validas = x_b_np[i][m_x_b[i] == 1]
+                vel_media_janela = np.mean(leituras_validas) if len(leituras_validas) > 0 else 0.0
+                
+                registros.append({
+                    "mae_stgcn": loss_stgcn,
+                    "mae_ma": loss_ma,
+                    "mae_ha": loss_ha,
+                    "mae_stgcn_60min": loss_stgcn_60,
+                    "mae_ma_60min": loss_ma_60,
+                    "vel_media": vel_media_janela
+                })
             
-            y_pred_stgcn_kmh = ((y_pred_stgcn_norm * std_speed) + mean_speed) * FATOR_KMH
-            y_pred_ma_kmh = ((y_pred_ma_norm * std_speed) + mean_speed) * FATOR_KMH
-            y_pred_global_kmh = ((y_pred_global_norm * std_speed) + mean_speed) * FATOR_KMH
-            y_true_kmh = ((y_true_norm * std_speed) + mean_speed) * FATOR_KMH
-            
-            velocidade_media_janela_kmh = np.mean((x_numpy[mask_x.astype(bool)] * std_speed + mean_speed) * FATOR_KMH) if len(elementos_validos) > 0 else (mean_speed * FATOR_KMH)
-            
-            # --- CÁLCULO DO MAE MASCARADO EM KM/H ---
-            mae_stgcn = masked_mae_numpy(y_pred_stgcn_kmh, y_true_kmh, mask_y_numpy)
-            mae_ma = masked_mae_numpy(y_pred_ma_kmh, y_true_kmh, mask_y_numpy)
-            mae_global = masked_mae_numpy(y_pred_global_kmh, y_true_kmh, mask_y_numpy)
-            
-            metricas_janelas.append({
-                "mae_stgcn_kmh": mae_stgcn,
-                "mae_ma_kmh": mae_ma,
-                "mae_global_kmh": mae_global,
-                "vel_media_kmh": velocidade_media_janela_kmh
-            })
-            
-            if i % 1000 == 0 and i > 0:
-                print(f"Progresso: {i}/{len(dataset_teste)} janelas...")
+            if (b_start // BATCH_SIZE) % 25 == 0:
+                print(f"Progresso: lote {b_start}/{total_janelas} processado...")
 
-    df_metricas = pd.DataFrame(metricas_janelas)
-
-    # Separação por Percentil de Trânsito (20% mais lentos = Pico/Congestionado)
-    limiar_pico = np.percentile(df_metricas["vel_media_kmh"], 20)
-    df_pico = df_metricas[df_metricas["vel_media_kmh"] <= limiar_pico]
-    df_livre = df_metricas[df_metricas["vel_media_kmh"] > limiar_pico]
-
+    df_metricas = pd.DataFrame(registros)
+    
+    # 4. Segregação por Percentil de Trânsito (20% mais lentos = Pico/Congestionado)
+    limiar_pico = np.percentile(df_metricas["vel_media"], 20)
+    df_pico = df_metricas[df_metricas["vel_media"] <= limiar_pico]
+    df_livre = df_metricas[df_metricas["vel_media"] > limiar_pico]
+    
     def calcular_sumario(df):
         if len(df) == 0: return 0.0, 0.0, 0.0, 0
-        return df["mae_global_kmh"].mean(), df["mae_ma_kmh"].mean(), df["mae_stgcn_kmh"].mean(), len(df)
+        ha_kmh = df["mae_ha"].mean() * std_speed * FATOR_KMH
+        ma_kmh = df["mae_ma"].mean() * std_speed * FATOR_KMH
+        st_kmh = df["mae_stgcn"].mean() * std_speed * FATOR_KMH
+        return ha_kmh, ma_kmh, st_kmh, len(df)
 
-    gb_g, ma_g, st_g, n_g = calcular_sumario(df_metricas)
-    gb_p, ma_p, st_p, n_p = calcular_sumario(df_pico)
     gb_l, ma_l, st_l, n_l = calcular_sumario(df_livre)
+    gb_p, ma_p, st_p, n_p = calcular_sumario(df_pico)
+    gb_g, ma_g, st_g, n_g = calcular_sumario(df_metricas)
 
-    print("\n" + "="*85)
-    print("🔬 RELATÓRIO FINAL DE DESEMPENHO (MÉTRICAS EM KM/H)")
-    print("="*85)
+    print("\n" + "="*92)
+    print("🔬 RELATÓRIO CIENTÍFICO DE DESEMPENHO (MÉTRICAS EM KM/H)")
+    print("="*92)
     print(f"{'CENÁRIO':<20} | {'GLOBAL BASELINE (HA)':<20} | {'MÉDIA MÓVEL (MA)':<20} | {'STGCN (IA)'}")
-    print("-" * 85)
-    print(f"{'Trânsito Livre':<20} | {gb_l:<20.4f} | {ma_l:<20.4f} | {st_l:<20.4f}")
-    print(f"{'Pico/Congestionado':<20} | {gb_p:<20.4f} | {ma_p:<20.4f} | {st_p:<20.4f}")
-    print("-" * 85)
-    print(f"{'MÉDIA GERAL':<20} | {gb_g:<20.4f} | {ma_g:<20.4f} | {st_g:<20.4f}")
-    print("="*85)
+    print("-" * 92)
+    print(f"{'Trânsito Livre':<20} | {gb_l:<16.2f} km/h | {ma_l:<16.2f} km/h | {st_l:<16.2f} km/h")
+    print(f"{'Pico/Congestionado':<20} | {gb_p:<16.2f} km/h | {ma_p:<16.2f} km/h | {st_p:<16.2f} km/h")
+    print("-" * 92)
+    print(f"{'MÉDIA GERAL':<20} | {gb_g:<16.2f} km/h | {ma_g:<16.2f} km/h | {st_g:<16.2f} km/h")
+    print("="*92)
+    
+    # Auditoria de Longo Prazo (60 minutos)
+    ma_60_kmh = df_metricas["mae_ma_60min"].mean() * std_speed * FATOR_KMH
+    st_60_kmh = df_metricas["mae_stgcn_60min"].mean() * std_speed * FATOR_KMH
+    print(f"\n📌 ANÁLISE DO HORIZONTE DE 60 MINUTOS:")
+    print(f" -> MAE Média Móvel (60 min): {ma_60_kmh:.2f} km/h")
+    print(f" -> MAE STGCN (60 min):       {st_60_kmh:.2f} km/h")
+    print(f" -> Vantagem do STGCN:        {ma_60_kmh - st_60_kmh:+.2f} km/h")
 
-    # Salvar para o artigo
+    # 5. Exportação dos Resultados para a pasta de logs
     log_dir = base_dir / "data" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     save_path = log_dir / "metricas_finais_kmh.csv"
-
+    
     resumo_df = pd.DataFrame({
         'Cenario': ['Transito Livre', 'Pico/Congestionado', 'Media Geral'],
         'MAE_HA_KMH': [gb_l, gb_p, gb_g],
@@ -144,7 +171,7 @@ def avaliar_modelos():
         'Amostras': [n_l, n_p, n_g]
     })
     resumo_df.to_csv(save_path, index=False)
-    print(f"\n✅ Resultados unificados salvos em: {save_path}")
+    print(f"\n✅ Relatório científico consolidado salvo em: {save_path}")
 
 if __name__ == "__main__":
-    avaliar_modelos()
+    avaliar_modelos_unificado()
