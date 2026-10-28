@@ -1,4 +1,4 @@
-🚦 RouteStation
+## RouteStation
 
 Arquitetura Híbrida Ciberfísica para Otimização de Rotas Logísticas Urbanas
 
